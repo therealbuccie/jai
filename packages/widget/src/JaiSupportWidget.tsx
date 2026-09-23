@@ -4,6 +4,7 @@ import './styles.css';
 export interface JaiSupportWidgetProps {
   appId: string;
   productName: string;
+  verifiedSessionToken?: string;
   supabaseUrl?: string;
   className?: string;
 }
@@ -62,7 +63,7 @@ function formatHistoryTime(value: string | null): string {
   return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
 }
 
-export function JaiSupportWidget({ appId, productName, supabaseUrl = defaultSupabaseUrl, className = '' }: JaiSupportWidgetProps) {
+export function JaiSupportWidget({ appId, productName, verifiedSessionToken, supabaseUrl = defaultSupabaseUrl, className = '' }: JaiSupportWidgetProps) {
   const [isOpen, setIsOpen] = useState(false);
   const [screen, setScreen] = useState<'home' | 'conversation'>('home');
   const [activeConversationId, setActiveConversationId] = useState<string | null>(null);
@@ -93,6 +94,7 @@ export function JaiSupportWidget({ appId, productName, supabaseUrl = defaultSupa
   const identityStorageKey = `${identityStoragePrefix}${appId}`;
 
   const readStoredConversationId = (): string | null => {
+    if (verifiedSessionToken) return null;
     try {
       const value = window.localStorage.getItem(conversationStorageKey);
       return isUuid(value) ? value : null;
@@ -102,6 +104,7 @@ export function JaiSupportWidget({ appId, productName, supabaseUrl = defaultSupa
   };
 
   const storeConversationId = (conversationId: string) => {
+    if (verifiedSessionToken) return;
     try { window.localStorage.setItem(conversationStorageKey, conversationId); } catch { /* Continue in memory. */ }
   };
 
@@ -133,6 +136,7 @@ export function JaiSupportWidget({ appId, productName, supabaseUrl = defaultSupa
   };
 
   const getSessionToken = async (forceNew = false): Promise<string> => {
+    if (verifiedSessionToken) return verifiedSessionToken;
     if (!forceNew) {
       const stored = readStoredSession();
       if (stored) return stored.sessionToken;
@@ -151,6 +155,7 @@ export function JaiSupportWidget({ appId, productName, supabaseUrl = defaultSupa
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify(action),
     });
+    if (response.status === 401 && verifiedSessionToken) throw new Error('Verified support session expired. Please sign in again.');
     if (response.status === 401 && !recovered) {
       try { window.localStorage.removeItem(sessionStorageKey); } catch { /* Continue with a fresh in-memory session. */ }
       return sendChatAction({ ...action }, true);
@@ -258,9 +263,10 @@ export function JaiSupportWidget({ appId, productName, supabaseUrl = defaultSupa
   };
 
   useEffect(() => {
-    try { setIdentitySaved(window.localStorage.getItem(identityStorageKey) === 'true'); } catch { /* Continue with the form visible. */ }
+    if (verifiedSessionToken) setIdentitySaved(true);
+    else try { setIdentitySaved(window.localStorage.getItem(identityStorageKey) === 'true'); } catch { /* Continue with the form visible. */ }
     void getSessionToken().catch(() => undefined);
-  }, [appId, identityStorageKey, supabaseUrl]);
+  }, [appId, identityStorageKey, supabaseUrl, verifiedSessionToken]);
 
   useEffect(() => {
     if (!isOpen || screen !== 'home') return;

@@ -158,7 +158,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
 
     const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(bearer[1]));
     const tokenHash = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
-    const sessionResponse = await database(`customer_sessions?session_token_hash=eq.${tokenHash}&select=id,customer_id,app_id,expires_at,revoked_at&limit=1`);
+    const sessionResponse = await database(`customer_sessions?session_token_hash=eq.${tokenHash}&select=id,customer_id,app_id,identity_level,expires_at,revoked_at&limit=1`);
     const sessions: unknown = await sessionResponse.json();
     if (!Array.isArray(sessions)) throw new Error("Invalid database response");
     if (sessions.length !== 1) throw new InputError("Invalid or expired session", 401);
@@ -335,6 +335,8 @@ Deno.serve(async (request: Request): Promise<Response> => {
     }
 
     if (input.action === "identify_customer") {
+      // Browser-provided metadata cannot replace a server-verified identity.
+      if (session.identity_level !== "anonymous") throw new InputError("Verified identity cannot be edited here", 403);
       await database(`customers?id=eq.${session.customer_id}`, "PATCH", {
         display_name: input.name,
         email: input.email,
