@@ -3,7 +3,7 @@
 // TODO: Add abuse controls/rate limiting before opening this endpoint broadly.
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
   "Access-Control-Max-Age": "86400",
 };
@@ -82,9 +82,30 @@ async function readInput(request: Request) {
 
 Deno.serve(async (request: Request): Promise<Response> => {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders });
+  if (request.method === "GET") {
+    const appId = new URL(request.url).searchParams.get("appId");
+    if (!appId || !UUID.test(appId)) return json(400, { error: "appId must be a UUID" });
+    const supabaseUrl = Deno.env.get("SUPABASE_URL");
+    const serviceKey = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY");
+    if (!supabaseUrl || !serviceKey) return json(500, { error: "App lookup unavailable" });
+    try {
+      const response = await fetch(`${supabaseUrl.replace(/\/$/, "")}/rest/v1/apps?id=eq.${encodeURIComponent(appId)}&status=eq.active&select=name&limit=1`, {
+        headers: { apikey: serviceKey, Authorization: `Bearer ${serviceKey}` },
+        signal: AbortSignal.timeout(10000), redirect: "error",
+      });
+      if (!response.ok) { await response.body?.cancel(); throw new Error("App lookup failed"); }
+      const apps: unknown = await response.json();
+      if (!Array.isArray(apps) || apps.length === 0) return json(404, { error: "Active app not found" });
+      const app: unknown = apps[0];
+      if (!isObject(app) || typeof app.name !== "string" || !app.name.trim()) throw new Error("Invalid app name");
+      return json(200, { name: app.name });
+    } catch {
+      return json(500, { error: "App lookup unavailable" });
+    }
+  }
   if (request.method !== "POST") {
     const response = json(405, { error: "Method not allowed" });
-    response.headers.set("Allow", "POST, OPTIONS");
+    response.headers.set("Allow", "GET, POST, OPTIONS");
     return response;
   }
 
