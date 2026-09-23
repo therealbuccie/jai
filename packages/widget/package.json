@@ -1,0 +1,18 @@
+{
+  "name": "@jai/widget",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "./src/index.ts",
+  "scripts": {
+    "build": "tsc --noEmit -p tsconfig.json",
+    "dev": "vite --host 127.0.0.1",
+    "build:standalone": "vite build --config vite.standalone.config.mjs"
+  },
+  "peerDependencies": {
+    "react": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0"
+  }
+}

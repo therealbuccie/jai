@@ -1,0 +1,9 @@
+{
+  "name": "jai",
+  "version": "0.0.0",
+  "private": true,
+  "workspaces": ["apps/*", "packages/*"],
+  "devDependencies": {
+    "typescript": "^5.9.3"
+  }
+}
