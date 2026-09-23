@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState } from 'react';
 import { supabase } from './supabaseClient';
+import { PrivateDataAccess } from './PrivateDataAccess';
 import './apps.css';
 
 type Application = { id: string; name: string; website_url: string | null; status: string };
 type Knowledge = { app_id: string; ready_pages: number; failed_pages: number; pending_pages: number; last_synced_at: string | null };
 type Capability = { key: string; kind: string };
-type ConnectKey = { kid: string; enabled: boolean; created_at: string };
+type ConnectKey = { id: string; created_at: string; revoked_at: string | null };
 const descriptions: Record<string, string> = {
   'knowledge.website.read': 'Read public website pages to learn about your application.',
   'customer.profile.read': 'Read customer profile details when a supported connection is available.',
@@ -26,7 +27,7 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
   const [connectKeys, setConnectKeys] = useState<ConnectKey[]>([]);
   const [connectKeysLoading, setConnectKeysLoading] = useState(false);
-  const [publicKey, setPublicKey] = useState('');
+  const [connectSecret, setConnectSecret] = useState<{ id: string; value: string } | null>(null);
   const [step, setStep] = useState<'list' | 'create' | 'consent' | 'install'>('list');
   const [selected, setSelected] = useState<Application | null>(null);
   const [name, setName] = useState(''); const [url, setUrl] = useState('');
@@ -50,12 +51,13 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
     let current = true;
     setConnectKeysLoading(true);
     setConnectKeys([]);
+    setConnectSecret(null);
     void (async () => {
       try {
-        const { data, error } = await supabase.from('jai_connect_keys').select('kid,enabled,created_at').eq('app_id', selected.id).order('created_at', { ascending: false });
+        const { data, error } = await supabase.rpc('list_jai_connect_credentials', { p_app_id: selected.id });
         if (!current) return;
         if (error) setError('Unable to load JAI Connect keys. Please retry.');
-        else setConnectKeys(data ?? []);
+        else setConnectKeys((data ?? []) as ConnectKey[]);
       } catch {
         if (current) setError('Unable to load JAI Connect keys. Please retry.');
       } finally {
@@ -88,21 +90,25 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
     // Consent success remains successful even if refreshing the list fails.
     try { await load(); } catch { setNotice('Access granted. Refresh Apps later to see the latest knowledge status.'); }
   }
-  async function registerConnectKey() {
+  async function generateConnectKey() {
     if (!supabase || !selected) return;
-    const key = publicKey.trim();
-    let valid = /^[A-Za-z0-9_-]{43}$/.test(key);
-    if (valid) {
-      try { valid = atob(key.replace(/-/g, '+').replace(/_/g, '/') + '=').length === 32; }
-      catch { valid = false; }
+    setConnectSecret(null);
+    const { data, error } = await supabase.rpc('generate_jai_connect_key', { p_app_id: selected.id });
+    if (error || !data || typeof data !== 'object' ||
+      typeof data.id !== 'string' || typeof data.secret !== 'string' ||
+      !/^jai_live_[a-f0-9]{64}$/.test(data.secret) || typeof data.created_at !== 'string') {
+      throw new Error('Unable to generate a JAI Connect key. Check your organization-admin access and retry.');
     }
-    if (!valid) throw new Error('Enter the 32-byte Ed25519 public key as the base64url JWK x value.');
-    const kid = crypto.randomUUID();
-    const { error } = await supabase.from('jai_connect_keys').insert({ app_id: selected.id, kid, public_key: key, enabled: true });
-    if (error) throw new Error('Unable to register this public key. Check your organization-admin access and retry.');
-    setConnectKeys(keys => [{ kid, enabled: true, created_at: new Date().toISOString() }, ...keys]);
-    setPublicKey('');
-    setNotice('Public key registered. Use the key ID below in assertions signed by your backend.');
+    setConnectKeys(keys => [{ id: data.id, created_at: data.created_at, revoked_at: null }, ...keys]);
+    setConnectSecret({ id: data.id, value: data.secret });
+  }
+  async function revokeConnectKey(id: string) {
+    if (!supabase || !selected) return;
+    const { data, error } = await supabase.rpc('revoke_jai_connect_key', { p_app_id: selected.id, p_credential_id: id });
+    if (error || data !== true) throw new Error('Unable to revoke the JAI Connect key. Please retry.');
+    setConnectKeys(keys => keys.map(key => key.id === id ? { ...key, revoked_at: new Date().toISOString() } : key));
+    setConnectSecret(current => current?.id === id ? null : current);
+    setNotice('Key revoked. It can no longer issue or redeem customer identity codes.');
   }
   const snippet = selected ? `<script
   src="https://widget.jposta.com/jai-widget.js"
@@ -142,15 +148,24 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
       <textarea aria-label="JAI widget installation snippet" readOnly rows={5} value={snippet} onFocus={e => e.target.select()} />
       <button onClick={() => void run(async () => { await navigator.clipboard.writeText(snippet); setNotice('Installation snippet copied.'); })}>Copy installation snippet</button>
       <p>Website knowledge can continue syncing in the background. Use Refresh status in Apps to check progress.</p>
-      <section aria-labelledby="jai-connect-heading"><h3 id="jai-connect-heading">JAI Connect / Customer identity</h3>
-        <p>Identify signed-in customers using assertions from your application's backend. Keep the private Ed25519 key on your backend; JAI needs only its public key.</p>
-        <p>{connectKeysLoading ? 'Checking identity setup...' : connectKeys.some(key => key.enabled) ? 'Identity integration configured' : 'Identity integration not configured'}</p>
-        {connectKeys.length > 0 && <ul>{connectKeys.map(key => <li key={key.kid}>Key ID ({key.enabled ? 'active' : 'disabled'}): <code>{key.kid}</code></li>)}</ul>}
-        <form className="apps-form" onSubmit={event => { event.preventDefault(); void run(registerConnectKey); }}>
-          <label>Ed25519 public key (JWK x, base64url)<input required maxLength={43} autoComplete="off" spellCheck={false} value={publicKey} disabled={busy} onChange={event => setPublicKey(event.target.value)} /></label>
-          <button disabled={busy || !publicKey.trim()}>{busy ? 'Registering...' : 'Register public key'}</button>
-        </form>
+      <section aria-labelledby="jai-connect-heading"><h3 id="jai-connect-heading">Customer Accounts</h3>
+        <p>Let JAI securely recognize customers signed into your application.</p>
+        <p>{connectKeysLoading ? 'Checking setup...' : connectKeys.some(key => !key.revoked_at) ? 'Customer Accounts - Configured \u2713' : 'Customer Accounts - Not configured'}</p>
+        {connectSecret && <div className="apps-form"><h3>Your JAI Connect Key</h3>
+          <input aria-label="New JAI Connect key" readOnly value={connectSecret.value} onFocus={event => event.target.select()} />
+          <button disabled={busy} onClick={() => void run(async () => { await navigator.clipboard.writeText(connectSecret.value); setNotice('Key copied.'); })}>Copy key</button>
+          <p>Copy this now. For security, JAI will not show this key again. Store it only in your application's backend secrets.</p>
+        </div>}
+        {connectKeys.length > 0 && <ul>{connectKeys.map(key => <li key={key.id}>
+          Key created {new Date(key.created_at).toLocaleString()} - {key.revoked_at ? 'Revoked' : 'Active'}
+          {!key.revoked_at && <button className="secondary" disabled={busy} onClick={() => void run(() => revokeConnectKey(key.id))}>Revoke key</button>}
+        </li>)}</ul>}
+        <p>Existing keys remain active during rotation until you revoke them. Keep every key on your application backend only.</p>
+        <button disabled={busy || connectKeysLoading} onClick={() => void run(generateConnectKey)}>
+          {busy ? 'Generating...' : connectKeys.some(key => !key.revoked_at) ? 'Generate new key' : 'Generate JAI Connect Key'}
+        </button>
       </section>
+      <PrivateDataAccess key={selected.id} appId={selected.id} appStatus={selected.status} isAdmin={isAdmin} />
       <button className="secondary" onClick={() => { setStep('consent'); setNotice(''); }}>Review website and access</button>
     </div>}
   </section>;

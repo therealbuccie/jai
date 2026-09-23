@@ -82,6 +82,9 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
   const [draft, setDraft] = useState('');
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [typingMessageId, setTypingMessageId] = useState<string | null>(null);
+  const [typingStage, setTypingStage] = useState(0);
+  const pendingReplyRef = useRef<{ conversationId: string | null; messageId: string | null; startedAt: number } | null>(null);
   const sessionRequestRef = useRef<Promise<string> | null>(null);
   const sendingRef = useRef(false);
   const syncInFlightRef = useRef(false);
@@ -256,6 +259,15 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
           status: message.status === 'read' || message.status === 'delivered' ? message.status : 'sent',
         }];
       });
+      const pending = pendingReplyRef.current;
+      if (pending?.conversationId === conversationId) {
+        const sentIndex = nextMessages.findIndex((message) => message.id === pending.messageId);
+        if (sentIndex >= 0 && nextMessages.slice(sentIndex + 1).some((message) => message.sender === 'support')) {
+          pendingReplyRef.current = null;
+          setTypingMessageId(null);
+          setTypingStage(0);
+        }
+      }
       setMessages(nextMessages);
     } finally {
       syncInFlightRef.current = false;
@@ -292,6 +304,8 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
   }, [focusNewConversation, isOpen, screen, activeConversationId, isSending]);
 
   const closeWidget = () => {
+    pendingReplyRef.current = null;
+    setTypingMessageId(null);
     setIsOpen(false);
     setScreen('home');
     setMessages([]);
@@ -306,6 +320,8 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
       return;
     }
     setScreen('home');
+    pendingReplyRef.current = null;
+    setTypingMessageId(null);
     setMessages([]);
     setActiveConversationId(null);
     setDraft('');
@@ -314,6 +330,8 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
   };
 
   const startNewConversation = () => {
+    pendingReplyRef.current = null;
+    setTypingMessageId(null);
     setFocusNewConversation(true);
     setMessages([]);
     setActiveConversationId(null);
@@ -329,6 +347,8 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
   const openConversation = (conversationId: string) => {
     const summary = conversationHistory.find((conversation) => conversation.conversationId === conversationId);
     if (!summary) return;
+    pendingReplyRef.current = null;
+    setTypingMessageId(null);
     setMessages([]);
     setActiveConversationId(conversationId);
     setFeedbackRating(summary.feedbackRating);
@@ -352,6 +372,10 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
     sendingRef.current = true;
     setIsSending(true);
     setSendError(null);
+    pendingReplyRef.current = { conversationId: activeConversationId, messageId: null, startedAt: Date.now() };
+    setTypingMessageId(crypto.randomUUID());
+    setTypingStage(0);
+    let sent = false;
     try {
       const result = await sendChatAction(activeConversationId
         ? { action: 'send_message', conversationId: activeConversationId, message: text }
@@ -361,6 +385,7 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
         setActiveConversationId(result.conversationId);
         storeConversationId(result.conversationId);
       }
+      sent = true;
       const messageId = isUuid(result.messageId) ? result.messageId : `customer-${Date.now()}`;
       setMessages((current) => [...current, {
         id: messageId,
@@ -373,10 +398,18 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
       const conversationId = activeConversationId || (isUuid(result.conversationId) ? result.conversationId : null);
       if (conversationId) {
         storeConversationId(conversationId);
+        if (pendingReplyRef.current) {
+          pendingReplyRef.current.conversationId = conversationId;
+          pendingReplyRef.current.messageId = isUuid(messageId) ? messageId : null;
+        }
         await syncMessages(conversationId);
         await syncConversationHistory();
       }
     } catch (error) {
+      if (sent) return; // A polling failure does not undo a saved message.
+      pendingReplyRef.current = null;
+      setTypingMessageId(null);
+      setTypingStage(0);
       const message = error instanceof Error && error.message !== 'Failed to fetch'
         ? error.message
         : 'Message could not be sent. Please try again.';
@@ -388,9 +421,17 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
   };
 
   useEffect(() => {
+    if (!typingMessageId || !pendingReplyRef.current) return;
+    const startedAt = pendingReplyRef.current.startedAt;
+    const eightSeconds = window.setTimeout(() => setTypingStage(1), Math.max(0, startedAt + 8000 - Date.now()));
+    const twentySeconds = window.setTimeout(() => setTypingStage(2), Math.max(0, startedAt + 20000 - Date.now()));
+    return () => { window.clearTimeout(eightSeconds); window.clearTimeout(twentySeconds); };
+  }, [typingMessageId]);
+
+  useEffect(() => {
     if (!threadRef.current) return;
     threadRef.current.scrollTop = threadRef.current.scrollHeight;
-  }, [messages]);
+  }, [messages, typingMessageId, typingStage]);
 
   const handleComposerKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -401,6 +442,16 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
 
   const activeConversationSummary = conversationHistory.find((conversation) => conversation.conversationId === activeConversationId);
   const activeConversationClosed = activeConversationSummary?.status === 'resolved';
+  const showTyping = typingMessageId !== null && !activeConversationClosed &&
+    pendingReplyRef.current?.conversationId === activeConversationId && !sendError;
+  useEffect(() => {
+    if (activeConversationClosed) {
+      pendingReplyRef.current = null;
+      setTypingMessageId(null);
+      setTypingStage(0);
+    }
+  }, [activeConversationClosed]);
+  useEffect(() => () => { pendingReplyRef.current = null; }, []);
   const widgetClassName = ['jai-support-widget', isOpen ? 'is-open' : '', className].filter(Boolean).join(' ');
 
   return (
@@ -513,6 +564,14 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
                       </div>
                     </div>
                   ))}
+                  {showTyping && <div className="jai-support-message-row support" aria-label="JAI is responding">
+                    <span className="jai-support-support-avatar" aria-hidden="true">J</span>
+                    <div className="jai-support-message-content"><div className="jai-support-bubble">
+                      <p aria-hidden="true">{[0, 1, 2].map((dot) => <span key={dot} style={{ display: 'inline-block', animation: 'jai-response-dot 1.2s ease-in-out infinite', animationDelay: `${dot * 0.16}s` }}>&#8226;</span>)}</p>
+                      {typingStage > 0 && <small style={{ color: '#61786d' }}>{typingStage === 1 ? 'Still working on this\u2026' : "This is taking a little longer, but I'm still working on it\u2026"}</small>}
+                    </div></div>
+                  </div>}
+                  {showTyping && <style>{`@keyframes jai-response-dot { 0%, 60%, 100% { opacity: .35; transform: translateY(0); } 30% { opacity: 1; transform: translateY(-2px); } } @media (prefers-reduced-motion: reduce) { .jai-support-thread .jai-support-message-row[aria-label="JAI is responding"] span[style] { animation: none !important; } }`}</style>}
                 </div>
                 {activeConversationClosed ? <div className="jai-support-closed-panel">
                   <div className="jai-support-feedback">

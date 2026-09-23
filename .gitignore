@@ -11,3 +11,8 @@ coverage/
 Thumbs.db
 
 supabase/.temp/
+
+jai-connect-signing-private.json
+jai-signing-secret.env
+
+jai-connect-keys/
