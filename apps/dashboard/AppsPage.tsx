@@ -65,17 +65,10 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
     // Consent success remains successful even if refreshing the list fails.
     try { await load(); } catch { setNotice('Access granted. Refresh Apps later to see the latest knowledge status.'); }
   }
-  const snippet = selected ? `import { JaiSupportWidget } from '@jai/widget';
-
-export function Support() {
-  return (
-    <JaiSupportWidget
-      appId={${JSON.stringify(selected.id)}}
-      productName={${JSON.stringify(selected.name)}}
-      supabaseUrl={${JSON.stringify(import.meta.env.VITE_SUPABASE_URL)}}
-    />
-  );
-}` : '';
+  const snippet = selected ? `<script
+  src="https://widget.jposta.com/jai-widget.js"
+  data-app-id="${selected.id}">
+</script>` : '';
   if (!isAdmin) return <section className="apps-page"><h1>Apps</h1><p>Organization admin access is required.</p></section>;
   return <section className="apps-page" aria-labelledby="apps-heading">
     <header className="apps-header"><div><h1 id="apps-heading">Apps</h1><p>Connect your applications to JAI.</p></div>
@@ -104,10 +97,10 @@ export function Support() {
       <button disabled={busy || !capabilities.length}>{busy ? 'Saving consent...' : 'Allow JAI'}</button></form>}
     {step === 'install' && selected && <div className="apps-card apps-form"><h2>Install JAI for {selected.name}</h2>
       <label>App ID<input readOnly value={selected.id} onFocus={e => e.target.select()} /></label>
-      <h3>React installation</h3><ol><li>Add the JAI widget package to your React application. The current package is private; obtain it from your JAI administrator or use the supplied workspace package.</li>
-        <li>Copy this component into your application and render it once in your shared layout. The package includes its widget styles.</li>
+      <h3>Website installation</h3><ol><li>Copy the code below and paste it once before the closing &lt;/body&gt; tag in your website's shared layout.</li>
+        <li>Publish your website changes. No React installation or package setup is required.</li>
         <li>Open your website and send a test message. Check the JAI Inbox for the new conversation.</li></ol>
-      <textarea aria-label="JAI widget installation snippet" readOnly rows={14} value={snippet} onFocus={e => e.target.select()} />
+      <textarea aria-label="JAI widget installation snippet" readOnly rows={5} value={snippet} onFocus={e => e.target.select()} />
       <button onClick={() => void run(async () => { await navigator.clipboard.writeText(snippet); setNotice('Installation snippet copied.'); })}>Copy installation snippet</button>
       <p>Website knowledge can continue syncing in the background. Use Refresh status in Apps to check progress.</p>
       <button className="secondary" onClick={() => { setStep('consent'); setNotice(''); }}>Review website and access</button>
