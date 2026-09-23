@@ -5,6 +5,7 @@ import './apps.css';
 type Application = { id: string; name: string; website_url: string | null; status: string };
 type Knowledge = { app_id: string; ready_pages: number; failed_pages: number; pending_pages: number; last_synced_at: string | null };
 type Capability = { key: string; kind: string };
+type ConnectKey = { kid: string; enabled: boolean; created_at: string };
 const descriptions: Record<string, string> = {
   'knowledge.website.read': 'Read public website pages to learn about your application.',
   'customer.profile.read': 'Read customer profile details when a supported connection is available.',
@@ -23,6 +24,9 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
   const [knowledge, setKnowledge] = useState<Knowledge[]>([]);
   const [grants, setGrants] = useState<string[]>([]);
   const [capabilities, setCapabilities] = useState<Capability[]>([]);
+  const [connectKeys, setConnectKeys] = useState<ConnectKey[]>([]);
+  const [connectKeysLoading, setConnectKeysLoading] = useState(false);
+  const [publicKey, setPublicKey] = useState('');
   const [step, setStep] = useState<'list' | 'create' | 'consent' | 'install'>('list');
   const [selected, setSelected] = useState<Application | null>(null);
   const [name, setName] = useState(''); const [url, setUrl] = useState('');
@@ -41,6 +45,25 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
     setApps(a.data ?? []); setKnowledge(k.data ?? []); setGrants((g.data ?? []).map(row => row.app_id)); setCapabilities(c.data ?? []);
   }
   useEffect(() => { void load().catch(e => setError(e.message)).finally(() => setLoading(false)); }, [organizationId, isAdmin]);
+  useEffect(() => {
+    if (!supabase || !isAdmin || step !== 'install' || !selected) return;
+    let current = true;
+    setConnectKeysLoading(true);
+    setConnectKeys([]);
+    void (async () => {
+      try {
+        const { data, error } = await supabase.from('jai_connect_keys').select('kid,enabled,created_at').eq('app_id', selected.id).order('created_at', { ascending: false });
+        if (!current) return;
+        if (error) setError('Unable to load JAI Connect keys. Please retry.');
+        else setConnectKeys(data ?? []);
+      } catch {
+        if (current) setError('Unable to load JAI Connect keys. Please retry.');
+      } finally {
+        if (current) setConnectKeysLoading(false);
+      }
+    })();
+    return () => { current = false; };
+  }, [step, selected?.id, isAdmin]);
   async function run(action: () => Promise<void>) {
     if (working.current) return; working.current = true; setBusy(true); setError(''); setNotice('');
     try { await action(); } catch (e) { setError(e instanceof Error ? e.message : 'Unable to complete this action.'); }
@@ -64,6 +87,22 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
     setNotice('Access granted. Website knowledge sync can continue in the background.');
     // Consent success remains successful even if refreshing the list fails.
     try { await load(); } catch { setNotice('Access granted. Refresh Apps later to see the latest knowledge status.'); }
+  }
+  async function registerConnectKey() {
+    if (!supabase || !selected) return;
+    const key = publicKey.trim();
+    let valid = /^[A-Za-z0-9_-]{43}$/.test(key);
+    if (valid) {
+      try { valid = atob(key.replace(/-/g, '+').replace(/_/g, '/') + '=').length === 32; }
+      catch { valid = false; }
+    }
+    if (!valid) throw new Error('Enter the 32-byte Ed25519 public key as the base64url JWK x value.');
+    const kid = crypto.randomUUID();
+    const { error } = await supabase.from('jai_connect_keys').insert({ app_id: selected.id, kid, public_key: key, enabled: true });
+    if (error) throw new Error('Unable to register this public key. Check your organization-admin access and retry.');
+    setConnectKeys(keys => [{ kid, enabled: true, created_at: new Date().toISOString() }, ...keys]);
+    setPublicKey('');
+    setNotice('Public key registered. Use the key ID below in assertions signed by your backend.');
   }
   const snippet = selected ? `<script
   src="https://widget.jposta.com/jai-widget.js"
@@ -103,6 +142,15 @@ export function AppsPage({ organizationId, isAdmin }: { organizationId: string; 
       <textarea aria-label="JAI widget installation snippet" readOnly rows={5} value={snippet} onFocus={e => e.target.select()} />
       <button onClick={() => void run(async () => { await navigator.clipboard.writeText(snippet); setNotice('Installation snippet copied.'); })}>Copy installation snippet</button>
       <p>Website knowledge can continue syncing in the background. Use Refresh status in Apps to check progress.</p>
+      <section aria-labelledby="jai-connect-heading"><h3 id="jai-connect-heading">JAI Connect / Customer identity</h3>
+        <p>Identify signed-in customers using assertions from your application's backend. Keep the private Ed25519 key on your backend; JAI needs only its public key.</p>
+        <p>{connectKeysLoading ? 'Checking identity setup...' : connectKeys.some(key => key.enabled) ? 'Identity integration configured' : 'Identity integration not configured'}</p>
+        {connectKeys.length > 0 && <ul>{connectKeys.map(key => <li key={key.kid}>Key ID ({key.enabled ? 'active' : 'disabled'}): <code>{key.kid}</code></li>)}</ul>}
+        <form className="apps-form" onSubmit={event => { event.preventDefault(); void run(registerConnectKey); }}>
+          <label>Ed25519 public key (JWK x, base64url)<input required maxLength={43} autoComplete="off" spellCheck={false} value={publicKey} disabled={busy} onChange={event => setPublicKey(event.target.value)} /></label>
+          <button disabled={busy || !publicKey.trim()}>{busy ? 'Registering...' : 'Register public key'}</button>
+        </form>
+      </section>
       <button className="secondary" onClick={() => { setStep('consent'); setNotice(''); }}>Review website and access</button>
     </div>}
   </section>;
