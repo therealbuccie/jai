@@ -58,6 +58,7 @@ export function TeamPage({ organizationId, isAdmin }: { organizationId: string; 
     {error && <p className="apps-error" role="alert">{error}</p>}
     {notice && <p role="status">{notice}</p>}
     {!loading && !error && !agents.length && <p role="status">No agents are available for this organization. Contact an organization admin.</p>}
+    {isAdmin && <Invitations organizationId={organizationId} />}
     <div className="apps-grid">{agents.map(agent => <form className="apps-card apps-form" key={agent.id} onSubmit={event => { event.preventDefault(); void save(agent); }}>
       <label>Customer-facing display name<input value={agent.name} maxLength={120} required disabled={!isAdmin || editing !== agent.id || saving !== null} onChange={event => {
         const name = event.target.value;
@@ -67,5 +68,67 @@ export function TeamPage({ organizationId, isAdmin }: { organizationId: string; 
       <p>{agent.role === 'admin' ? 'Administrator' : 'Agent'}</p>
       {isAdmin && (editing === agent.id ? <button type="submit" disabled={saving !== null}>{saving === agent.id ? 'Saving...' : 'Save display name'}</button> : <button type="button" disabled={saving !== null} onClick={() => setEditing(agent.id)}>Edit name</button>)}
     </form>)}</div>
+  </section>;
+}
+
+type Invitation = { id: string; email: string; display_name: string; expires_at: string };
+function Invitations({ organizationId }: { organizationId: string }) {
+  const [apps, setApps] = useState<Array<{ id: string; name: string }>>([]);
+  const [invitations, setInvitations] = useState<Invitation[]>([]);
+  const [email, setEmail] = useState(''); const [name, setName] = useState('');
+  const [selected, setSelected] = useState<string[]>([]);
+  const [busy, setBusy] = useState(false); const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(''); const [notice, setNotice] = useState('');
+  async function refresh() {
+    if (!supabase) throw new Error();
+    const [a, i] = await Promise.all([
+      supabase.from('apps').select('id, name').eq('organization_id', organizationId).order('name'),
+      supabase.rpc('list_team_invitations'),
+    ]);
+    if (a.error || i.error || !Array.isArray(i.data)) throw new Error();
+    setApps(a.data ?? []); setInvitations(i.data);
+  }
+  useEffect(() => { void refresh().catch(() => setError('Unable to load invitations.')).finally(() => setLoading(false)); }, [organizationId]);
+  async function deliver(id: string) {
+    if (!supabase) throw new Error();
+    const { data, error } = await supabase.functions.invoke('team-invitations', { body: { invitation_id: id } });
+    if (error || data?.sent !== true) throw new Error();
+  }
+  async function act(action: 'create' | 'resend' | 'revoke', id?: string) {
+    if (!supabase || busy) return;
+    setBusy(true); setError(''); setNotice('');
+    try {
+      if (action === 'create') {
+        const normalized = email.trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized) || !name.trim() || name.trim().length > 120 ||
+          /[\u0000-\u001f\u007f-\u009f@]/.test(name) || !selected.length) throw new Error();
+        const result = await supabase.rpc('create_team_invitation', { p_email: normalized, p_name: name.trim(), p_app_ids: selected });
+        if (result.error || typeof result.data !== 'string') throw new Error();
+        setEmail(''); setName(''); setSelected([]);
+        await refresh(); await deliver(result.data); setNotice('Invitation email sent.');
+      } else if (action === 'resend' && id) { await deliver(id); setNotice('Invitation email sent.'); }
+      else if (id) { const { error } = await supabase.rpc('revoke_team_invitation', { p_invitation_id: id }); if (error) throw new Error(); setNotice('Invitation revoked.'); }
+      await refresh();
+    } catch { setError('Unable to complete this request. Check pending invitations before retrying. Email failures can be retried after one minute.'); }
+    finally { setBusy(false); }
+  }
+  return <section className="apps-card">
+    <h2>Invite agent</h2>
+    {loading ? <p>Loading invitations...</p> : <>
+      <form className="apps-form" onSubmit={event => { event.preventDefault(); void act('create'); }}>
+        <label>Email<input type="email" maxLength={254} required disabled={busy} value={email} onChange={event => setEmail(event.target.value)} /></label>
+        <label>Customer-facing display name<input required maxLength={120} disabled={busy} value={name} onChange={event => setName(event.target.value)} /></label>
+        <fieldset disabled={busy}><legend>Apps this agent may support</legend>{apps.map(app => <label key={app.id}>
+          <input type="checkbox" checked={selected.includes(app.id)} onChange={event => setSelected(ids => event.target.checked ? [...ids, app.id] : ids.filter(id => id !== app.id))} />{app.name}
+        </label>)}</fieldset>
+        <button disabled={busy || !selected.length}>Send invite</button>
+      </form>
+      <h3>Pending invitations</h3>
+      {!invitations.length && <p>No pending invitations.</p>}
+      {invitations.map(invite => <div key={invite.id}><p>{invite.display_name} ? {invite.email} ? Expires {new Date(invite.expires_at).toLocaleDateString()}</p>
+        <button disabled={busy} onClick={() => void act('resend', invite.id)}>Resend</button>{' '}
+        <button disabled={busy} onClick={() => void act('revoke', invite.id)}>Revoke</button>
+      </div>)}
+    </>}{error && <p role="alert" className="apps-error">{error}</p>}{notice && <p role="status">{notice}</p>}
   </section>;
 }

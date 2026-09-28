@@ -1,3 +1,4 @@
+import { AcceptInvitation } from './AcceptInvitation';
 import { useEffect, useRef, useState } from 'react';
 import type { User } from '@supabase/supabase-js';
 import { supabase, supabaseConfigError } from './supabaseClient';
@@ -85,6 +86,48 @@ async function loadAgentPoints(agentId: string): Promise<number> {
 
 function getSection() { const section = window.location.hash.slice(1); return ['inbox', 'apps', 'customers', 'team', 'settings'].includes(section) ? section : 'inbox'; }
 
+function TransferControl({ conversation, onTransferred }: { conversation: Conversation; onTransferred: (conversation: Conversation) => void }) {
+  const [open, setOpen] = useState(false);
+  const [agents, setAgents] = useState<Array<{ id: string; name: string; assignment_id: string }>>([]);
+  const [target, setTarget] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  async function load() {
+    if (!supabase || busy) return;
+    setOpen(true); setBusy(true); setError(''); setAgents([]); setTarget('');
+    try {
+      const { data, error } = await supabase.rpc('eligible_transfer_agents', { p_conversation_id: conversation.id });
+      if (error || !Array.isArray(data)) throw new Error();
+      setAgents(data);
+    } catch { setError('Unable to load eligible agents.'); }
+    finally { setBusy(false); }
+  }
+  async function transfer() {
+    const agent = agents.find(item => item.id === target);
+    if (!supabase || !agent || busy) return;
+    setBusy(true); setError('');
+    try {
+      const { data, error } = await supabase.rpc('transfer_conversation', {
+        p_conversation_id: conversation.id, p_target_agent_id: agent.id, p_assignment_id: agent.assignment_id,
+      });
+      if (error || !data || data.id !== conversation.id || data.assigned_agent_id !== agent.id) throw new Error();
+      onTransferred({ ...conversation, ...data, assignedAgent: { name: agent.name } });
+      setOpen(false);
+    } catch { setError('Unable to transfer. Reopen Transfer to refresh the assignment.'); }
+    finally { setBusy(false); }
+  }
+  return <div><button type="button" disabled={busy} onClick={() => void load()}>Transfer</button>
+    {open && <div role="dialog" aria-label="Transfer conversation">
+      {busy && <p role="status">Please wait...</p>}
+      {!busy && !error && !agents.length && <p>No eligible agents available.</p>}
+      {!!agents.length && <><select aria-label="New assigned agent" value={target} disabled={busy} onChange={event => setTarget(event.target.value)}>
+        <option value="">Select an agent</option>{agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+      </select><button type="button" disabled={busy || !target} onClick={() => void transfer()}>Confirm transfer</button></>}
+      <button type="button" disabled={busy} onClick={() => setOpen(false)}>Cancel</button>
+    </div>}{error && <p role="alert">{error}</p>}
+  </div>;
+}
+
 function ApprovedDashboardPresentation({
   section,
   agent,
@@ -107,11 +150,13 @@ function ApprovedDashboardPresentation({
   setComposerText,
   sendMessage,
   closeConversation,
+  onTransferred,
   claimConversation,
   isClaiming,
   claimError,
   feedback,
   agentPoints,
+  onLogout,
   sendError,
   isSending,
 }: {
@@ -136,14 +181,18 @@ function ApprovedDashboardPresentation({
   setComposerText: (text: string) => void;
   sendMessage: () => Promise<void>;
   closeConversation: () => Promise<void>;
+  onTransferred: (conversation: Conversation) => void;
   claimConversation: () => Promise<void>;
   isClaiming: boolean;
   claimError: string | null;
   feedback: ConversationFeedback | null;
   agentPoints: number;
+  onLogout: () => Promise<void>;
   sendError: string | null;
   isSending: boolean;
 }) {
+  const canControl = !!selected && (agent.role === 'admin' || selected.assigned_agent_id === agent.id);
+  const canReply = canControl && selected?.status !== 'resolved';
   const [assignOpen, setAssignOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [internalNote, setInternalNote] = useState(false);
@@ -186,7 +235,7 @@ function ApprovedDashboardPresentation({
         <a className="nav-item" href="#settings" aria-current={section === 'settings' ? 'page' : undefined}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 3-.6 2.3-1.6.9-2.3-.6-2.5 4.3 1.7 1.7v1.8l-1.7 1.7L5 19.4l2.3-.6 1.6.9.6 2.3h5l.6-2.3 1.6-.9 2.3.6 2.5-4.3-1.7-1.7v-1.8l1.7-1.7L19 5.6l-2.3.6-1.6-.9L14.5 3Z" /><circle cx="12" cy="12.5" r="3.3" /></svg><span>Settings</span></a>
         <a className="nav-item" href="#apps" aria-current={section === 'apps' ? 'page' : undefined}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></svg><span>Apps</span></a>
       </nav>
-      <div className="agent-profile" aria-label="Agent profile"><div className="agent-avatar" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 22v-2a8 8 0 0 1 16 0v2" /></svg><span className="status-dot" /></div><span className="agent-name">{agent.name}</span><span className="agent-status">{agent.status}</span><span className="agent-points">{agentPoints} points</span></div>
+      <div className="agent-profile" aria-label="Agent profile"><div className="agent-avatar" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 22v-2a8 8 0 0 1 16 0v2" /></svg><span className="status-dot" /></div><span className="agent-name">{agent.name}</span><span className="agent-status">{agent.status}</span><span className="agent-points">{agentPoints} points</span><button type="button" onClick={() => void onLogout()} style={{ gridColumn: '2 / -1', justifySelf: 'start', background: 'none', border: 0, padding: '4px 0', color: 'inherit', font: 'inherit', cursor: 'pointer' }}>Log out</button></div>
     </aside>
     <main className="content" aria-label={section} id={section} tabIndex={-1}>
       {section === 'apps' && <AppsPage organizationId={agent.organization_id} isAdmin={agent.role === 'admin'} />}
@@ -201,9 +250,9 @@ function ApprovedDashboardPresentation({
         </div>
       </section>}
       {section === 'inbox' && selected && <section className="workspace" aria-label={`${customerName} conversation`}>
-        <header className="workspace-header"><div className="workspace-person"><div className="workspace-avatar">{customerInitials}<span /></div><div><h1>{customerName}</h1><p>Customer <span>&bull;</span> {selected.app?.name || 'Unknown app'}</p></div></div><div className="workspace-actions"><span className="status-control">{conversationLabel(selected, agent)}</span><div className="assign-wrap">{selected.handler === 'human_queue' && selected.status !== 'resolved' && selected.assigned_agent_id === null && <button className="assign-button" style={{ background: '#123f32', color: 'white', borderColor: '#123f32' }} type="button" disabled={isClaiming} onClick={() => void claimConversation()}>{isClaiming ? 'Claiming...' : 'Claim'}</button>}<button className="assign-button" onClick={() => setAssignOpen((open) => !open)}>Assign</button>{assignOpen && <div className="assign-popover" role="dialog" aria-label="Assign conversation"><button className="assign-me" disabled>Assign to me</button><p className="data-state">Assignment controls are not active yet.</p></div>}</div><div className="overflow-wrap"><button className="overflow-button" onClick={() => setMoreOpen((open) => !open)} aria-label="More options"><span /><span /><span /></button>{moreOpen && <div className="more-menu" role="menu"><button disabled>Transfer conversation</button><button onClick={() => { setInternalNote((note) => !note); setMoreOpen(false); }}>Add internal note</button><button disabled={selected.status === 'resolved'} onClick={() => { void closeConversation(); setMoreOpen(false); }}>Close conversation</button></div>}</div></div></header>
+        <header className="workspace-header"><div className="workspace-person"><div className="workspace-avatar">{customerInitials}<span /></div><div><h1>{customerName}</h1><p>Customer <span>&bull;</span> {selected.app?.name || 'Unknown app'}</p></div></div><div className="workspace-actions"><span className="status-control">{conversationLabel(selected, agent)}</span><div className="assign-wrap">{selected.handler === 'human_queue' && selected.status !== 'resolved' && selected.assigned_agent_id === null && <button className="assign-button" style={{ background: '#123f32', color: 'white', borderColor: '#123f32' }} type="button" disabled={isClaiming} onClick={() => void claimConversation()}>{isClaiming ? 'Claiming...' : 'Claim'}</button>}<button className="assign-button" onClick={() => setAssignOpen((open) => !open)}>Assign</button>{assignOpen && <div className="assign-popover" role="dialog" aria-label="Assign conversation"><button className="assign-me" disabled>Assign to me</button><p className="data-state">Assignment controls are not active yet.</p></div>}</div><div className="overflow-wrap"><button className="overflow-button" onClick={() => setMoreOpen((open) => !open)} aria-label="More options"><span /><span /><span /></button>{moreOpen && <div className="more-menu" role="menu">{canControl && selected.handler === 'human_agent' && selected.status === 'open' && <TransferControl key={`${selected.id}:${selected.assigned_agent_id}`} conversation={selected} onTransferred={onTransferred} />}<button onClick={() => { setInternalNote((note) => !note); setMoreOpen(false); }}>Add internal note</button>{canControl && <button disabled={selected.status === 'resolved'} onClick={() => { void closeConversation(); setMoreOpen(false); }}>Resolve</button>}</div>}</div></div></header>
         <div className="thread" ref={threadRef}>{claimError && <p className="data-state data-error" role="alert">{claimError}</p>}{threadLoading && <p className="data-state">Loading messages...</p>}{!threadLoading && !messages.length && <p className="data-state">No messages in this conversation.</p>}{messages.map((message) => { const isCustomer = message.sender_type === 'customer'; return <div className={`message ${isCustomer ? 'customer-message' : 'agent-message'}`} key={message.id}><p>{message.content || (message.message_type === 'attachment' ? 'Attachment' : 'System message')}</p><div className="message-footer"><time>{formatTime(message.created_at)}</time>{!isCustomer && <span className="read-indicator" aria-label="Sent">&#10003;</span>}</div></div>; })}</div>
-        <div className={internalNote ? 'composer-area is-internal-note' : 'composer-area'}><div className="composer"><button className="attachment-button" aria-label="Attach file" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.5 11.5-8.8 8.8a5 5 0 0 1-7.1-7.1l9.5-9.5a3.4 3.4 0 1 1 4.8 4.8l-9.5 9.5a1.7 1.7 0 1 1-2.4-2.4l8.8-8.8" /></svg></button><input aria-label={`Message ${customerName}`} placeholder={selected.status === 'resolved' ? 'Conversation closed' : internalNote ? 'Write an internal note...' : 'Write a message...'} value={composerText} onChange={(event) => { setComposerText(event.target.value); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} disabled={isSending || selected.status === 'resolved'} /><button className="send-button" aria-label="Send message" onClick={() => void sendMessage()} disabled={isSending || !composerText.trim() || selected.status === 'resolved'}>{isSending ? '...' : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 3-8.2 18-3.1-7-6.7-3.1Z" /><path d="m9.7 14 4.2-4.2" /></svg>}</button></div>{sendError && <p className="composer-error" role="alert">{sendError}</p>}<button className="note-toggle" onClick={() => setInternalNote((note) => !note)} disabled={selected.status === 'resolved'}><span>+</span> {internalNote ? 'Reply mode' : 'Internal note'}</button></div>
+        <div className={internalNote ? 'composer-area is-internal-note' : 'composer-area'}><div className="composer"><button className="attachment-button" aria-label="Attach file" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.5 11.5-8.8 8.8a5 5 0 0 1-7.1-7.1l9.5-9.5a3.4 3.4 0 1 1 4.8 4.8l-9.5 9.5a1.7 1.7 0 1 1-2.4-2.4l8.8-8.8" /></svg></button><input aria-label={`Message ${customerName}`} placeholder={selected.status === 'resolved' ? 'Conversation closed' : internalNote ? 'Write an internal note...' : 'Write a message...'} value={composerText} onChange={(event) => { setComposerText(event.target.value); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} disabled={isSending || !canReply} /><button className="send-button" aria-label="Send message" onClick={() => void sendMessage()} disabled={isSending || !composerText.trim() || !canReply}>{isSending ? '...' : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 3-8.2 18-3.1-7-6.7-3.1Z" /><path d="m9.7 14 4.2-4.2" /></svg>}</button></div>{sendError && <p className="composer-error" role="alert">{sendError}</p>}<button className="note-toggle" onClick={() => setInternalNote((note) => !note)} disabled={selected.status === 'resolved'}><span>+</span> {internalNote ? 'Reply mode' : 'Internal note'}</button></div>
       </section>}
       {section === 'inbox' && !inboxLoading && !selected && <section className="workspace"><div className="data-state">Select an authorized conversation to view its thread.</div></section>}
       {section === 'inbox' && selected && customerPanelOpen && <aside className="customer-panel" aria-label="Customer context"><button className="customer-close" onClick={() => setCustomerPanelOpen(false)} aria-label="Close customer panel">x</button><div className="customer-summary"><div className="customer-context-avatar">{customerInitials}</div><h2>{customerName}</h2>{selected.customer?.email && <a href={`mailto:${selected.customer.email}`}>{selected.customer.email}</a>}</div><dl className="customer-facts"><div><dt>Product</dt><dd>{selected.app?.name || 'Unknown app'}</dd></div><div><dt>Status</dt><dd>{conversationLabel(selected, agent)}</dd></div><div><dt>Created</dt><dd>{formatDate(selected.created_at)}</dd></div></dl><section className="recent-conversations"><h3>Conversations</h3>{selectedCustomerConversations.map((conversation) => <button className={`customer-conversation${conversation.id === selectedConversationId ? ' is-selected' : ''}`} key={conversation.id} onClick={() => selectConversation(conversation)}><strong>{conversation.latestMessage?.content || 'Conversation'}</strong><span>{conversationLabel(conversation, agent)} · {formatTime(conversation.latestMessage?.created_at || conversation.updated_at)}</span></button>)}</section>{feedback && <section className="customer-feedback"><h3>Support feedback</h3><div className="feedback-stars" aria-label={`${feedback.rating} out of 5 stars`}>{[1, 2, 3, 4, 5].map((star) => <span className={star <= feedback.rating ? 'is-selected' : ''} key={star}>★</span>)}</div>{feedback.review_text && <p>{feedback.review_text}</p>}</section>}<section className="customer-notes"><div><h3>Notes</h3><button aria-label="Add note" disabled>+</button></div><p>Customer notes are not available.</p></section></aside>}
@@ -211,7 +260,7 @@ function ApprovedDashboardPresentation({
   </div>;
 }
 
-function DashboardApp({ agentContext }: { agentContext: AgentContext }) {
+function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; onLogout: () => Promise<void> }) {
   const [section, setSection] = useState(getSection);
   const [customerPanelOpen, setCustomerPanelOpen] = useState(true);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -257,7 +306,7 @@ function DashboardApp({ agentContext }: { agentContext: AgentContext }) {
   const sendMessage = async () => {
     const content = composerText.trim();
     if (!content || !selectedConversationId || isSending || !supabase) return;
-    if (selected?.status === 'resolved') {
+    if (selected?.status === 'resolved' || (agentContext.agent.role !== 'admin' && selected?.assigned_agent_id !== agentContext.agent.id)) {
       setSendError('This conversation is closed.');
       return;
     }
@@ -311,16 +360,19 @@ function DashboardApp({ agentContext }: { agentContext: AgentContext }) {
     }
   };
 
+  const lifecycleBusy = useRef(false);
   const closeConversation = async () => {
-    if (!selectedConversationId || !supabase || selected?.status === 'resolved') return;
-    const { error } = await supabase.from('conversations').update({ status: 'resolved' }).eq('id', selectedConversationId);
-    if (error) {
-      setSendError('Unable to close this conversation.');
-      return;
-    }
-    setConversations((items) => items.map((conversation) => conversation.id === selectedConversationId
-      ? { ...conversation, status: 'resolved' }
-      : conversation));
+    if (!selected || !supabase || selected.status === 'resolved' || lifecycleBusy.current) return;
+    const conversationId = selected.id;
+    lifecycleBusy.current = true; setSendError(null);
+    try {
+      const { data, error } = await supabase.rpc('resolve_conversation', {
+        p_conversation_id: conversationId, p_expected_agent_id: selected.assigned_agent_id,
+      });
+      if (error || !data || data.id !== conversationId || data.status !== 'resolved') throw new Error();
+      setConversations(items => items.map(item => item.id === conversationId ? { ...item, ...data } : item));
+    } catch { setSendError('Unable to resolve. Refresh the conversation and try again.'); }
+    finally { lifecycleBusy.current = false; }
   };
 
   const selected = conversations.find((conversation) => conversation.id === selectedConversationId) as Conversation;
@@ -351,12 +403,17 @@ function DashboardApp({ agentContext }: { agentContext: AgentContext }) {
     composerText={composerText}
     setComposerText={setComposerText}
     sendMessage={sendMessage}
+    onTransferred={conversation => {
+      setConversations(items => items.map(item => item.id === conversation.id ? conversation : item));
+      setComposerText('');
+    }}
     closeConversation={closeConversation}
     claimConversation={claimConversation}
     isClaiming={isClaiming}
     claimError={claimError?.conversationId === selectedConversationId ? claimError.message : null}
     feedback={conversationFeedback}
     agentPoints={agentPoints}
+    onLogout={onLogout}
     sendError={sendError}
     isSending={isSending}
   />;
@@ -377,4 +434,78 @@ function AuthMessage({ children, action }: { children: React.ReactNode; action?:
 
 async function resolveAgentContext(user: User): Promise<AgentContext> { if (!supabase) throw new Error(supabaseConfigError ?? 'Supabase is not configured.'); const { data: agent, error: agentError } = await supabase.from('human_agents').select('id, auth_user_id, organization_id, name, email, role, status').eq('auth_user_id', user.id).maybeSingle(); if (agentError) throw new Error('Unable to resolve the JAI agent profile.'); if (!agent) throw new Error('This account is authenticated but is not authorized as a JAI human agent.'); const [{ data: organization, error: organizationError }, { data: apps, error: appsError }, { data: appAccess, error: accessError }] = await Promise.all([supabase.from('organizations').select('id, name').eq('id', agent.organization_id).single(), supabase.from('apps').select('id, organization_id, name, slug, status').eq('organization_id', agent.organization_id).order('name'), supabase.from('agent_app_access').select('app_id').eq('agent_id', agent.id)]); if (organizationError || appsError || accessError || !organization) throw new Error('Unable to load the JAI agent access context.'); return { user, agent, organization, apps: apps ?? [], appAccess: appAccess ?? [] }; }
 
-export default function App() { const [authState, setAuthState] = useState<'checking' | 'signed-out' | 'authenticated' | 'unauthorized'>(supabase ? 'checking' : 'signed-out'); const [agentContext, setAgentContext] = useState<AgentContext | null>(null); const [authError, setAuthError] = useState<string | null>(supabaseConfigError); const [isSubmitting, setIsSubmitting] = useState(false); const applySession = async (user: User | null) => { if (!user) { setAgentContext(null); setAuthError(null); setAuthState('signed-out'); return; } setAuthState('checking'); try { const context = await resolveAgentContext(user); setAgentContext(context); setAuthError(null); setAuthState('authenticated'); } catch (error) { setAgentContext(null); setAuthError(error instanceof Error ? error.message : 'This account is not authorized for the JAI dashboard.'); setAuthState('unauthorized'); } }; useEffect(() => { if (!supabase) return; let mounted = true; void supabase.auth.getSession().then(({ data: { session } }) => { if (mounted) void applySession(session?.user ?? null); }); const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => { if (mounted) void applySession(session?.user ?? null); }); return () => { mounted = false; subscription.unsubscribe(); }; }, []); const signIn = async (email: string, password: string) => { if (!supabase) return; setIsSubmitting(true); setAuthError(null); const { error } = await supabase.auth.signInWithPassword({ email, password }); if (error) setAuthError(error.message); setIsSubmitting(false); }; const signOut = async () => { if (supabase) await supabase.auth.signOut(); }; if (authState === 'checking') return <AuthMessage>Checking your JAI session...</AuthMessage>; if (authState === 'signed-out') return <LoginScreen onSubmit={signIn} error={authError} isSubmitting={isSubmitting} />; if (authState === 'unauthorized') return <AuthMessage action={<button type="button" onClick={() => void signOut()}>Sign out</button>}>{authError ?? 'This account is not authorized as a JAI human agent.'}</AuthMessage>; if (!agentContext) return <AuthMessage>Unable to load the JAI dashboard.</AuthMessage>; return <DashboardApp agentContext={agentContext} />; }
+export default function App() {
+  const invitationId = new URLSearchParams(window.location.search).get('invitation');
+  if (invitationId) return <AcceptInvitation invitationId={invitationId} />;
+  return <AuthenticatedApp />;
+}
+function AuthenticatedApp() {
+  const [authState, setAuthState] = useState<'checking' | 'signed-out' | 'authenticated' | 'unauthorized'>(supabase ? 'checking' : 'signed-out');
+  const [agentContext, setAgentContext] = useState<AgentContext | null>(null);
+  const [authError, setAuthError] = useState<string | null>(supabaseConfigError);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const sessionVersion = useRef(0);
+  const loggingOut = useRef(false);
+  useEffect(() => {
+    if (!supabase) return;
+    let mounted = true;
+    const applySession = (user: User | null) => {
+      const version = ++sessionVersion.current;
+      setAgentContext(null);
+      setAuthError(null);
+      if (!user || loggingOut.current) { setAuthState('signed-out'); return; }
+      setAuthState('checking');
+      // Leave the Auth callback before starting authenticated database requests.
+      void Promise.resolve().then(() => {
+        if (!mounted || version !== sessionVersion.current) return null;
+        return resolveAgentContext(user);
+      }).then(context => {
+        if (!mounted || version !== sessionVersion.current || !context) return;
+        setAgentContext(context); setAuthState('authenticated');
+      }).catch(() => {
+        if (!mounted || version !== sessionVersion.current) return;
+        setAuthError('Unable to load your authorized agent account.'); setAuthState('unauthorized');
+      });
+    };
+    const initialVersion = sessionVersion.current;
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (mounted) applySession(session?.user ?? null);
+    });
+    void supabase.auth.getSession().then(({ data, error }) => {
+      if (!mounted || sessionVersion.current !== initialVersion) return;
+      if (error) { setAuthError('Unable to load your session. Please sign in.'); setAuthState('signed-out'); }
+      else applySession(data.session?.user ?? null);
+    }).catch(() => {
+      if (mounted && sessionVersion.current === initialVersion) {
+        setAuthError('Unable to load your session. Please sign in.'); setAuthState('signed-out');
+      }
+    });
+    return () => { mounted = false; ++sessionVersion.current; subscription.unsubscribe(); };
+  }, []);
+  const signIn = async (email: string, password: string) => {
+    if (!supabase || loggingOut.current) return;
+    setIsSubmitting(true); setAuthError(null);
+    try {
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) setAuthError('Unable to sign in. Check your credentials.');
+    } catch { setAuthError('Unable to sign in. Please try again.'); }
+    finally { setIsSubmitting(false); }
+  };
+  const signOut = async () => {
+    if (!supabase || loggingOut.current) return;
+    loggingOut.current = true;
+    ++sessionVersion.current;
+    setAgentContext(null); setAuthError(null); setAuthState('signed-out'); setIsSubmitting(true);
+    try {
+      const { error } = await supabase.auth.signOut({ scope: 'local' });
+      if (error) throw error;
+    } catch {
+      setAuthError('Log out could not be completed. Please retry.'); setAuthState('unauthorized');
+    } finally { loggingOut.current = false; setIsSubmitting(false); }
+  };
+  if (authState === 'checking') return <AuthMessage>Checking your JAI session...</AuthMessage>;
+  if (authState === 'signed-out') return <LoginScreen onSubmit={signIn} error={authError} isSubmitting={isSubmitting} />;
+  if (authState === 'unauthorized') return <AuthMessage action={<button type="button" onClick={() => void signOut()}>Log out</button>}>{authError ?? 'This account is not authorized as a JAI human agent.'}</AuthMessage>;
+  if (!agentContext) return <AuthMessage>Unable to load the JAI dashboard.</AuthMessage>;
+  return <DashboardApp key={agentContext.user.id} agentContext={agentContext} onLogout={signOut} />;
+}
