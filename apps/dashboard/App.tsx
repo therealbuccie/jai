@@ -86,9 +86,10 @@ async function loadAgentPoints(agentId: string): Promise<number> {
 
 function getSection() { const section = window.location.hash.slice(1); return ['inbox', 'apps', 'customers', 'team', 'settings'].includes(section) ? section : 'inbox'; }
 
-function TransferControl({ conversation, onTransferred }: { conversation: Conversation; onTransferred: (conversation: Conversation) => void }) {
+function TransferControl({ conversation, onTransferred, assign = false }: { conversation: Conversation; onTransferred: (conversation: Conversation) => void; assign?: boolean }) {
+  const action = assign ? 'Assign' : 'Transfer';
   const [open, setOpen] = useState(false);
-  const [agents, setAgents] = useState<Array<{ id: string; name: string; assignment_id: string }>>([]);
+  const [agents, setAgents] = useState<Array<{ id: string; name: string; assignment_id: string | null }>>([]);
   const [target, setTarget] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -107,22 +108,23 @@ function TransferControl({ conversation, onTransferred }: { conversation: Conver
     if (!supabase || !agent || busy) return;
     setBusy(true); setError('');
     try {
-      const { data, error } = await supabase.rpc('transfer_conversation', {
-        p_conversation_id: conversation.id, p_target_agent_id: agent.id, p_assignment_id: agent.assignment_id,
+      const { data, error } = await supabase.rpc(assign ? 'assign_conversation' : 'transfer_conversation', {
+        p_conversation_id: conversation.id, p_target_agent_id: agent.id,
+        ...(assign ? {} : { p_assignment_id: agent.assignment_id }),
       });
       if (error || !data || data.id !== conversation.id || data.assigned_agent_id !== agent.id) throw new Error();
       onTransferred({ ...conversation, ...data, assignedAgent: { name: agent.name } });
       setOpen(false);
-    } catch { setError('Unable to transfer. Reopen Transfer to refresh the assignment.'); }
+    } catch { setError(`Unable to ${action.toLowerCase()}. Refresh the conversation before retrying.`); }
     finally { setBusy(false); }
   }
-  return <div><button type="button" disabled={busy} onClick={() => void load()}>Transfer</button>
-    {open && <div role="dialog" aria-label="Transfer conversation">
+  return <div><button type="button" disabled={busy} className={assign ? 'assign-button' : undefined} onClick={() => void load()}>{action}</button>
+    {open && <div className={assign ? "assign-popover" : undefined} role="dialog" aria-label={`${action} conversation`}>
       {busy && <p role="status">Please wait...</p>}
       {!busy && !error && !agents.length && <p>No eligible agents available.</p>}
       {!!agents.length && <><select aria-label="New assigned agent" value={target} disabled={busy} onChange={event => setTarget(event.target.value)}>
         <option value="">Select an agent</option>{agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
-      </select><button type="button" disabled={busy || !target} onClick={() => void transfer()}>Confirm transfer</button></>}
+      </select><button type="button" disabled={busy || !target} onClick={() => void transfer()}>Confirm {action.toLowerCase()}</button></>}
       <button type="button" disabled={busy} onClick={() => setOpen(false)}>Cancel</button>
     </div>}{error && <p role="alert">{error}</p>}
   </div>;
@@ -192,8 +194,7 @@ function ApprovedDashboardPresentation({
   isSending: boolean;
 }) {
   const canControl = !!selected && (agent.role === 'admin' || selected.assigned_agent_id === agent.id);
-  const canReply = canControl && selected?.status !== 'resolved';
-  const [assignOpen, setAssignOpen] = useState(false);
+  const canReply = selected?.handler === 'human_agent' && selected.assigned_agent_id === agent.id && selected.status !== 'resolved';
   const [moreOpen, setMoreOpen] = useState(false);
   const [internalNote, setInternalNote] = useState(false);
   const [now, setNow] = useState(Date.now);
@@ -250,7 +251,7 @@ function ApprovedDashboardPresentation({
         </div>
       </section>}
       {section === 'inbox' && selected && <section className="workspace" aria-label={`${customerName} conversation`}>
-        <header className="workspace-header"><div className="workspace-person"><div className="workspace-avatar">{customerInitials}<span /></div><div><h1>{customerName}</h1><p>Customer <span>&bull;</span> {selected.app?.name || 'Unknown app'}</p></div></div><div className="workspace-actions"><span className="status-control">{conversationLabel(selected, agent)}</span><div className="assign-wrap">{selected.handler === 'human_queue' && selected.status !== 'resolved' && selected.assigned_agent_id === null && <button className="assign-button" style={{ background: '#123f32', color: 'white', borderColor: '#123f32' }} type="button" disabled={isClaiming} onClick={() => void claimConversation()}>{isClaiming ? 'Claiming...' : 'Claim'}</button>}<button className="assign-button" onClick={() => setAssignOpen((open) => !open)}>Assign</button>{assignOpen && <div className="assign-popover" role="dialog" aria-label="Assign conversation"><button className="assign-me" disabled>Assign to me</button><p className="data-state">Assignment controls are not active yet.</p></div>}</div><div className="overflow-wrap"><button className="overflow-button" onClick={() => setMoreOpen((open) => !open)} aria-label="More options"><span /><span /><span /></button>{moreOpen && <div className="more-menu" role="menu">{canControl && selected.handler === 'human_agent' && selected.status === 'open' && <TransferControl key={`${selected.id}:${selected.assigned_agent_id}`} conversation={selected} onTransferred={onTransferred} />}<button onClick={() => { setInternalNote((note) => !note); setMoreOpen(false); }}>Add internal note</button>{canControl && <button disabled={selected.status === 'resolved'} onClick={() => { void closeConversation(); setMoreOpen(false); }}>Resolve</button>}</div>}</div></div></header>
+        <header className="workspace-header"><div className="workspace-person"><div className="workspace-avatar">{customerInitials}<span /></div><div><h1>{customerName}</h1><p>Customer <span>&bull;</span> {selected.app?.name || 'Unknown app'}</p></div></div><div className="workspace-actions"><span className="status-control">{conversationLabel(selected, agent)}</span><div className="assign-wrap">{selected.handler === 'human_queue' && selected.status !== 'resolved' && selected.assigned_agent_id === null && <button className="assign-button" style={{ background: '#123f32', color: 'white', borderColor: '#123f32' }} type="button" disabled={isClaiming} onClick={() => void claimConversation()}>{isClaiming ? 'Claiming...' : 'Claim'}</button>}{agent.role === 'admin' && selected.status === 'open' && selected.handler === 'human_queue' && selected.assigned_agent_id === null && <TransferControl key={selected.id} assign conversation={selected} onTransferred={onTransferred} />}</div><div className="overflow-wrap"><button className="overflow-button" onClick={() => setMoreOpen((open) => !open)} aria-label="More options"><span /><span /><span /></button>{moreOpen && <div className="more-menu" role="menu">{canControl && selected.handler === 'human_agent' && selected.status === 'open' && <TransferControl key={`${selected.id}:${selected.assigned_agent_id}`} conversation={selected} onTransferred={onTransferred} />}<button onClick={() => { setInternalNote((note) => !note); setMoreOpen(false); }}>Add internal note</button>{canControl && <button disabled={selected.status === 'resolved'} onClick={() => { void closeConversation(); setMoreOpen(false); }}>Resolve</button>}</div>}</div></div></header>
         <div className="thread" ref={threadRef}>{claimError && <p className="data-state data-error" role="alert">{claimError}</p>}{threadLoading && <p className="data-state">Loading messages...</p>}{!threadLoading && !messages.length && <p className="data-state">No messages in this conversation.</p>}{messages.map((message) => { const isCustomer = message.sender_type === 'customer'; return <div className={`message ${isCustomer ? 'customer-message' : 'agent-message'}`} key={message.id}><p>{message.content || (message.message_type === 'attachment' ? 'Attachment' : 'System message')}</p><div className="message-footer"><time>{formatTime(message.created_at)}</time>{!isCustomer && <span className="read-indicator" aria-label="Sent">&#10003;</span>}</div></div>; })}</div>
         <div className={internalNote ? 'composer-area is-internal-note' : 'composer-area'}><div className="composer"><button className="attachment-button" aria-label="Attach file" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.5 11.5-8.8 8.8a5 5 0 0 1-7.1-7.1l9.5-9.5a3.4 3.4 0 1 1 4.8 4.8l-9.5 9.5a1.7 1.7 0 1 1-2.4-2.4l8.8-8.8" /></svg></button><input aria-label={`Message ${customerName}`} placeholder={selected.status === 'resolved' ? 'Conversation closed' : internalNote ? 'Write an internal note...' : 'Write a message...'} value={composerText} onChange={(event) => { setComposerText(event.target.value); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} disabled={isSending || !canReply} /><button className="send-button" aria-label="Send message" onClick={() => void sendMessage()} disabled={isSending || !composerText.trim() || !canReply}>{isSending ? '...' : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 3-8.2 18-3.1-7-6.7-3.1Z" /><path d="m9.7 14 4.2-4.2" /></svg>}</button></div>{sendError && <p className="composer-error" role="alert">{sendError}</p>}<button className="note-toggle" onClick={() => setInternalNote((note) => !note)} disabled={selected.status === 'resolved'}><span>+</span> {internalNote ? 'Reply mode' : 'Internal note'}</button></div>
       </section>}
@@ -306,7 +307,7 @@ function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; 
   const sendMessage = async () => {
     const content = composerText.trim();
     if (!content || !selectedConversationId || isSending || !supabase) return;
-    if (selected?.status === 'resolved' || (agentContext.agent.role !== 'admin' && selected?.assigned_agent_id !== agentContext.agent.id)) {
+    if (selected?.status === 'resolved' || selected?.handler !== 'human_agent' || selected?.assigned_agent_id !== agentContext.agent.id) {
       setSendError('This conversation is closed.');
       return;
     }
