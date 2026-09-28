@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { User } from '@supabase/supabase-js';
 import { supabase, supabaseConfigError } from './supabaseClient';
 import { AppsPage } from './AppsPage';
+import { TeamPage } from './TeamPage';
 
 type Agent = { id: string; auth_user_id: string; organization_id: string; name: string; email: string; role: 'admin' | 'agent'; status: 'online' | 'offline' | 'away' };
 type AuthorizedApp = { id: string; organization_id: string; name: string; slug: string; status: 'active' | 'inactive' };
@@ -10,8 +11,8 @@ type AgentContext = { user: User; agent: Agent; organization: Organization; apps
 type Message = { id: string; conversation_id: string; sender_type: 'customer' | 'automation' | 'human_agent' | 'system'; sender_id: string | null; message_type: 'text' | 'attachment' | 'system' | 'internal_note'; status: 'sent' | 'delivered' | 'read'; content: string | null; created_at: string };
 type Customer = { id: string; display_name: string | null; email: string | null; phone: string | null };
 type App = { id: string; name: string; slug: string; status: 'active' | 'inactive' };
-type Conversation = { id: string; app_id: string; customer_id: string; status: 'open' | 'pending' | 'resolved'; handler: 'automation' | 'human_queue' | 'human_agent'; assigned_agent_id: string | null; created_at: string; updated_at: string; customer: Customer | null; app: App | null; latestMessage: Message | null };
-type ConversationRow = Omit<Conversation, 'customer' | 'app' | 'latestMessage'> & { customers: Customer[] | Customer | null; apps: App[] | App | null };
+type Conversation = { id: string; app_id: string; customer_id: string; status: 'open' | 'pending' | 'resolved'; handler: 'automation' | 'human_queue' | 'human_agent'; assigned_agent_id: string | null; created_at: string; updated_at: string; customer: Customer | null; app: App | null; latestMessage: Message | null; waitingSince?: string; assignedAgent?: { name: string } | null };
+type ConversationRow = Omit<Conversation, 'customer' | 'app' | 'latestMessage' | 'assignedAgent'> & { assigned_agent: { name: string }[] | { name: string } | null; customers: Customer[] | Customer | null; apps: App[] | App | null };
 type CustomerInboxGroup = { customerId: string; customer: Customer | null; openConversations: Conversation[]; latestConversation: Conversation };
 type ConversationFeedback = { id: string; conversation_id: string; rating: number; review_text: string | null; submitted_at: string };
 
@@ -21,10 +22,27 @@ const initialsFor = (name: string | null | undefined) => (name || 'Customer').sp
 const toneFor = (id: string) => ['sage', 'sand', 'rose', 'blue', 'lilac', 'peach', 'mint'][Number.parseInt(id.replace(/-/g, '').slice(0, 2), 16) % 7];
 const relationOne = <T,>(value: T[] | T | null | undefined): T | null => Array.isArray(value) ? value[0] ?? null : value ?? null;
 
+const isWaiting = (conversation: Conversation) => conversation.handler === 'human_queue' && conversation.status !== 'resolved';
+const inInbox = (conversation: Conversation) => conversation.status === 'open' || isWaiting(conversation);
+const waitingAt = (conversation: Conversation) => Date.parse(conversation.waitingSince || conversation.updated_at);
+const inboxPriority = (left: Conversation, right: Conversation) => {
+  if (isWaiting(left) !== isWaiting(right)) return isWaiting(left) ? -1 : 1;
+  if (isWaiting(left)) return waitingAt(left) - waitingAt(right) || left.id.localeCompare(right.id);
+  return Date.parse(right.latestMessage?.created_at || right.updated_at) - Date.parse(left.latestMessage?.created_at || left.updated_at);
+};
+const conversationLabel = (conversation: Conversation, agent: Agent) => conversation.status === 'resolved' ? 'Closed'
+  : isWaiting(conversation) ? 'Waiting for agent'
+  : conversation.handler === 'human_agent' ? (conversation.assigned_agent_id === agent.id ? 'Assigned to you' : conversation.assignedAgent?.name?.trim() ? `Assigned to ${conversation.assignedAgent.name}` : 'Assigned to agent')
+  : conversation.status;
+const waitingTime = (conversation: Conversation, now: number) => {
+  const minutes = Math.max(0, Math.floor((now - waitingAt(conversation)) / 60000));
+  return minutes < 1 ? 'less than a minute' : minutes < 60 ? `${minutes}m` : minutes < 1440 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${Math.floor(minutes / 1440)}d ${Math.floor(minutes % 1440 / 60)}h`;
+};
+
 async function loadConversations(): Promise<Conversation[]> {
   if (!supabase) throw new Error(supabaseConfigError ?? 'Supabase is not configured.');
   const { data, error } = await supabase.from('conversations')
-    .select('id, app_id, customer_id, status, handler, assigned_agent_id, created_at, updated_at, customers (id, display_name, email, phone), apps (id, name, slug, status)')
+    .select('id, app_id, customer_id, status, handler, assigned_agent_id, created_at, updated_at, customers (id, display_name, email, phone), apps (id, name, slug, status), assigned_agent:human_agents!conversations_assigned_agent_id_fkey (name)')
     .order('updated_at', { ascending: false });
   if (error) throw new Error('Unable to load authorized conversations.');
   const rows = (data ?? []) as unknown as ConversationRow[];
@@ -33,9 +51,15 @@ async function loadConversations(): Promise<Conversation[]> {
     .select('id, conversation_id, sender_type, sender_id, message_type, status, content, created_at')
     .in('conversation_id', rows.map((row) => row.id)).order('created_at', { ascending: false });
   if (messagesError) throw new Error('Unable to load conversation previews.');
+  const handoffs = new Map<string, string>();
+  for (const message of (messages ?? []) as Message[]) {
+    if (message.sender_type === 'automation' && message.message_type === 'text' &&
+      message.content === "I couldn't complete that request right now. I'll connect you with a member of our support team. Please hold on for a moment." &&
+      !handoffs.has(message.conversation_id)) handoffs.set(message.conversation_id, message.created_at);
+  }
   const latest = new Map<string, Message>();
   for (const message of (messages ?? []) as Message[]) if (!latest.has(message.conversation_id)) latest.set(message.conversation_id, message);
-  return rows.map(({ customers, apps, ...row }) => ({ ...row, customer: relationOne(customers), app: relationOne(apps), latestMessage: latest.get(row.id) ?? null }));
+  return rows.map(({ customers, apps, assigned_agent, ...row }) => ({ ...row, assignedAgent: relationOne(assigned_agent), customer: relationOne(customers), app: relationOne(apps), latestMessage: latest.get(row.id) ?? null, waitingSince: handoffs.get(row.id) }));
 }
 
 async function loadMessages(conversationId: string): Promise<Message[]> {
@@ -123,21 +147,23 @@ function ApprovedDashboardPresentation({
   const [assignOpen, setAssignOpen] = useState(false);
   const [moreOpen, setMoreOpen] = useState(false);
   const [internalNote, setInternalNote] = useState(false);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 30000); return () => window.clearInterval(timer); }, []);
   const threadRef = useRef<HTMLDivElement>(null);
   const customerName = selected?.customer?.display_name || 'Unknown customer';
   const customerInitials = initialsFor(selected?.customer?.display_name);
   const customerGroups = Array.from(
-    conversations.filter((conversation) => conversation.status === 'open').reduce((groups, conversation) => {
+    conversations.filter(inInbox).reduce((groups, conversation) => {
       const existing = groups.get(conversation.customer_id);
       if (existing) existing.openConversations.push(conversation);
       else groups.set(conversation.customer_id, { customerId: conversation.customer_id, customer: conversation.customer, openConversations: [conversation], latestConversation: conversation });
       return groups;
     }, new Map<string, CustomerInboxGroup>()),
   ).map(([, group]) => {
-    group.openConversations.sort((left, right) => Date.parse(right.latestMessage?.created_at || right.updated_at) - Date.parse(left.latestMessage?.created_at || left.updated_at));
+    group.openConversations.sort(inboxPriority);
     group.latestConversation = group.openConversations[0];
     return group;
-  }).sort((left, right) => Date.parse(right.latestConversation.latestMessage?.created_at || right.latestConversation.updated_at) - Date.parse(left.latestConversation.latestMessage?.created_at || left.latestConversation.updated_at));
+  }).sort((left, right) => inboxPriority(left.latestConversation, right.latestConversation));
   const selectedCustomerConversations = selectedCustomerId
     ? conversations.filter((conversation) => conversation.customer_id === selectedCustomerId).sort((left, right) => Date.parse(right.latestMessage?.created_at || right.updated_at) - Date.parse(left.latestMessage?.created_at || left.updated_at))
     : [];
@@ -163,23 +189,24 @@ function ApprovedDashboardPresentation({
       <div className="agent-profile" aria-label="Agent profile"><div className="agent-avatar" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 22v-2a8 8 0 0 1 16 0v2" /></svg><span className="status-dot" /></div><span className="agent-name">{agent.name}</span><span className="agent-status">{agent.status}</span><span className="agent-points">{agentPoints} points</span></div>
     </aside>
     <main className="content" aria-label={section} id={section} tabIndex={-1}>
-      {section === 'apps' && <AppsPage organizationId={agent.organization_id} isAdmin={agent.role === 'admin'} />} 
+      {section === 'apps' && <AppsPage organizationId={agent.organization_id} isAdmin={agent.role === 'admin'} />}
+      {section === 'team' && <TeamPage organizationId={agent.organization_id} isAdmin={agent.role === 'admin'} />} 
       {section === 'inbox' && <section className="inbox-panel" aria-labelledby="inbox-title">
         <header className="inbox-header"><h1 id="inbox-title">Inbox</h1><p>Conversations</p></header>
         <label className="conversation-search"><span className="sr-only">Search conversations</span><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.5" /><path d="m16 16 4 4" /></svg><input type="search" placeholder="Search conversations" /></label>
         <div className="conversation-tabs" role="tablist" aria-label="Conversation filters"><button className="conversation-tab is-active" role="tab" aria-selected="true">Open <span>{openCount}</span></button><button className="conversation-tab" role="tab" aria-selected="false">Mine <span>{mineCount}</span></button><button className="conversation-tab" role="tab" aria-selected="false">Unassigned <span>{unassignedCount}</span></button></div>
         <div className="conversation-list" aria-label="Authorized conversations">
           {inboxLoading && <p className="data-state">Loading conversations...</p>}{!inboxLoading && dataError && <p className="data-state data-error">{dataError}</p>}{!inboxLoading && !dataError && !customerGroups.length && <p className="data-state">No open conversations yet.</p>}
-          {customerGroups.map((group) => { const conversation = group.latestConversation; const name = group.customer?.display_name || 'Unknown customer'; return <button className={`conversation${group.customerId === selectedCustomerId ? ' is-selected' : ''}`} key={group.customerId} onClick={() => selectConversation(conversation)}><div className={`conversation-avatar ${toneFor(group.customerId)}`} aria-hidden="true">{initialsFor(name)}</div><div className="conversation-copy"><div className="conversation-meta"><h2>{name}</h2><time>{formatTime(conversation.latestMessage?.created_at || conversation.updated_at)}</time></div><p>{conversation.latestMessage?.content || 'No messages yet.'}</p><small>{conversation.app?.name || 'Unknown app'}{group.openConversations.length > 1 ? ` · ${group.openConversations.length} open` : ''}</small></div></button>; })}
+          {customerGroups.map((group) => { const conversation = group.latestConversation; const name = group.customer?.display_name || 'Unknown customer'; return <button className={`conversation${group.customerId === selectedCustomerId ? ' is-selected' : ''}`} key={group.customerId} onClick={() => selectConversation(conversation)}><div className={`conversation-avatar ${toneFor(group.customerId)}`} aria-hidden="true">{initialsFor(name)}</div><div className="conversation-copy"><div className="conversation-meta"><h2>{name}</h2><time>{formatTime(conversation.latestMessage?.created_at || conversation.updated_at)}</time></div><p>{isWaiting(conversation) ? `Waiting for agent \u00b7 ${waitingTime(conversation, now)}` : conversation.handler === 'human_agent' ? conversationLabel(conversation, agent) : conversation.latestMessage?.content || 'No messages yet.'}</p><small>{conversation.app?.name || 'Unknown app'}{group.openConversations.length > 1 ? ` · ${group.openConversations.length} open` : ''}</small></div></button>; })}
         </div>
       </section>}
       {section === 'inbox' && selected && <section className="workspace" aria-label={`${customerName} conversation`}>
-        <header className="workspace-header"><div className="workspace-person"><div className="workspace-avatar">{customerInitials}<span /></div><div><h1>{customerName}</h1><p>Customer <span>&bull;</span> {selected.app?.name || 'Unknown app'}</p></div></div><div className="workspace-actions"><span className="status-control">{selected.status === 'resolved' ? 'Closed' : selected.status}</span><div className="assign-wrap">{selected.handler === 'human_queue' && selected.status !== 'resolved' && selected.assigned_agent_id === null && <button className="assign-button" type="button" disabled={isClaiming} onClick={() => void claimConversation()}>{isClaiming ? 'Claiming...' : 'Claim'}</button>}<button className="assign-button" onClick={() => setAssignOpen((open) => !open)}>Assign</button>{assignOpen && <div className="assign-popover" role="dialog" aria-label="Assign conversation"><button className="assign-me" disabled>Assign to me</button><p className="data-state">Assignment controls are not active yet.</p></div>}</div><div className="overflow-wrap"><button className="overflow-button" onClick={() => setMoreOpen((open) => !open)} aria-label="More options"><span /><span /><span /></button>{moreOpen && <div className="more-menu" role="menu"><button disabled>Transfer conversation</button><button onClick={() => { setInternalNote((note) => !note); setMoreOpen(false); }}>Add internal note</button><button disabled={selected.status === 'resolved'} onClick={() => { void closeConversation(); setMoreOpen(false); }}>Close conversation</button></div>}</div></div></header>
+        <header className="workspace-header"><div className="workspace-person"><div className="workspace-avatar">{customerInitials}<span /></div><div><h1>{customerName}</h1><p>Customer <span>&bull;</span> {selected.app?.name || 'Unknown app'}</p></div></div><div className="workspace-actions"><span className="status-control">{conversationLabel(selected, agent)}</span><div className="assign-wrap">{selected.handler === 'human_queue' && selected.status !== 'resolved' && selected.assigned_agent_id === null && <button className="assign-button" style={{ background: '#123f32', color: 'white', borderColor: '#123f32' }} type="button" disabled={isClaiming} onClick={() => void claimConversation()}>{isClaiming ? 'Claiming...' : 'Claim'}</button>}<button className="assign-button" onClick={() => setAssignOpen((open) => !open)}>Assign</button>{assignOpen && <div className="assign-popover" role="dialog" aria-label="Assign conversation"><button className="assign-me" disabled>Assign to me</button><p className="data-state">Assignment controls are not active yet.</p></div>}</div><div className="overflow-wrap"><button className="overflow-button" onClick={() => setMoreOpen((open) => !open)} aria-label="More options"><span /><span /><span /></button>{moreOpen && <div className="more-menu" role="menu"><button disabled>Transfer conversation</button><button onClick={() => { setInternalNote((note) => !note); setMoreOpen(false); }}>Add internal note</button><button disabled={selected.status === 'resolved'} onClick={() => { void closeConversation(); setMoreOpen(false); }}>Close conversation</button></div>}</div></div></header>
         <div className="thread" ref={threadRef}>{claimError && <p className="data-state data-error" role="alert">{claimError}</p>}{threadLoading && <p className="data-state">Loading messages...</p>}{!threadLoading && !messages.length && <p className="data-state">No messages in this conversation.</p>}{messages.map((message) => { const isCustomer = message.sender_type === 'customer'; return <div className={`message ${isCustomer ? 'customer-message' : 'agent-message'}`} key={message.id}><p>{message.content || (message.message_type === 'attachment' ? 'Attachment' : 'System message')}</p><div className="message-footer"><time>{formatTime(message.created_at)}</time>{!isCustomer && <span className="read-indicator" aria-label="Sent">&#10003;</span>}</div></div>; })}</div>
         <div className={internalNote ? 'composer-area is-internal-note' : 'composer-area'}><div className="composer"><button className="attachment-button" aria-label="Attach file" disabled><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m20.5 11.5-8.8 8.8a5 5 0 0 1-7.1-7.1l9.5-9.5a3.4 3.4 0 1 1 4.8 4.8l-9.5 9.5a1.7 1.7 0 1 1-2.4-2.4l8.8-8.8" /></svg></button><input aria-label={`Message ${customerName}`} placeholder={selected.status === 'resolved' ? 'Conversation closed' : internalNote ? 'Write an internal note...' : 'Write a message...'} value={composerText} onChange={(event) => { setComposerText(event.target.value); }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void sendMessage(); } }} disabled={isSending || selected.status === 'resolved'} /><button className="send-button" aria-label="Send message" onClick={() => void sendMessage()} disabled={isSending || !composerText.trim() || selected.status === 'resolved'}>{isSending ? '...' : <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m21 3-8.2 18-3.1-7-6.7-3.1Z" /><path d="m9.7 14 4.2-4.2" /></svg>}</button></div>{sendError && <p className="composer-error" role="alert">{sendError}</p>}<button className="note-toggle" onClick={() => setInternalNote((note) => !note)} disabled={selected.status === 'resolved'}><span>+</span> {internalNote ? 'Reply mode' : 'Internal note'}</button></div>
       </section>}
       {section === 'inbox' && !inboxLoading && !selected && <section className="workspace"><div className="data-state">Select an authorized conversation to view its thread.</div></section>}
-      {section === 'inbox' && selected && customerPanelOpen && <aside className="customer-panel" aria-label="Customer context"><button className="customer-close" onClick={() => setCustomerPanelOpen(false)} aria-label="Close customer panel">x</button><div className="customer-summary"><div className="customer-context-avatar">{customerInitials}</div><h2>{customerName}</h2>{selected.customer?.email && <a href={`mailto:${selected.customer.email}`}>{selected.customer.email}</a>}</div><dl className="customer-facts"><div><dt>Product</dt><dd>{selected.app?.name || 'Unknown app'}</dd></div><div><dt>Status</dt><dd>{selected.status === 'resolved' ? 'Closed' : selected.status}</dd></div><div><dt>Created</dt><dd>{formatDate(selected.created_at)}</dd></div></dl><section className="recent-conversations"><h3>Conversations</h3>{selectedCustomerConversations.map((conversation) => <button className={`customer-conversation${conversation.id === selectedConversationId ? ' is-selected' : ''}`} key={conversation.id} onClick={() => selectConversation(conversation)}><strong>{conversation.latestMessage?.content || 'Conversation'}</strong><span>{conversation.status === 'resolved' ? 'Closed' : 'Open'} · {formatTime(conversation.latestMessage?.created_at || conversation.updated_at)}</span></button>)}</section>{feedback && <section className="customer-feedback"><h3>Support feedback</h3><div className="feedback-stars" aria-label={`${feedback.rating} out of 5 stars`}>{[1, 2, 3, 4, 5].map((star) => <span className={star <= feedback.rating ? 'is-selected' : ''} key={star}>★</span>)}</div>{feedback.review_text && <p>{feedback.review_text}</p>}</section>}<section className="customer-notes"><div><h3>Notes</h3><button aria-label="Add note" disabled>+</button></div><p>Customer notes are not available.</p></section></aside>}
+      {section === 'inbox' && selected && customerPanelOpen && <aside className="customer-panel" aria-label="Customer context"><button className="customer-close" onClick={() => setCustomerPanelOpen(false)} aria-label="Close customer panel">x</button><div className="customer-summary"><div className="customer-context-avatar">{customerInitials}</div><h2>{customerName}</h2>{selected.customer?.email && <a href={`mailto:${selected.customer.email}`}>{selected.customer.email}</a>}</div><dl className="customer-facts"><div><dt>Product</dt><dd>{selected.app?.name || 'Unknown app'}</dd></div><div><dt>Status</dt><dd>{conversationLabel(selected, agent)}</dd></div><div><dt>Created</dt><dd>{formatDate(selected.created_at)}</dd></div></dl><section className="recent-conversations"><h3>Conversations</h3>{selectedCustomerConversations.map((conversation) => <button className={`customer-conversation${conversation.id === selectedConversationId ? ' is-selected' : ''}`} key={conversation.id} onClick={() => selectConversation(conversation)}><strong>{conversation.latestMessage?.content || 'Conversation'}</strong><span>{conversationLabel(conversation, agent)} · {formatTime(conversation.latestMessage?.created_at || conversation.updated_at)}</span></button>)}</section>{feedback && <section className="customer-feedback"><h3>Support feedback</h3><div className="feedback-stars" aria-label={`${feedback.rating} out of 5 stars`}>{[1, 2, 3, 4, 5].map((star) => <span className={star <= feedback.rating ? 'is-selected' : ''} key={star}>★</span>)}</div>{feedback.review_text && <p>{feedback.review_text}</p>}</section>}<section className="customer-notes"><div><h3>Notes</h3><button aria-label="Add note" disabled>+</button></div><p>Customer notes are not available.</p></section></aside>}
     </main>
   </div>;
 }
@@ -207,7 +234,7 @@ function DashboardApp({ agentContext }: { agentContext: AgentContext }) {
   useEffect(() => { const update = () => setSection(getSection()); window.addEventListener('hashchange', update); return () => window.removeEventListener('hashchange', update); }, []);
   useEffect(() => {
     let mounted = true;
-    void loadConversations().then((items) => { if (mounted) { const initialConversation = items.find((conversation) => conversation.status === 'open') ?? items[0] ?? null; setConversations(items); setSelectedConversationId(initialConversation?.id ?? null); setSelectedCustomerId(initialConversation?.customer_id ?? null); setInboxLoading(false); } }).catch((error) => { if (mounted) { setDataError(error instanceof Error ? error.message : 'Unable to load conversations.'); setInboxLoading(false); } });
+    void loadConversations().then((items) => { if (mounted) { const initialConversation = items.filter(inInbox).sort(inboxPriority)[0] ?? items[0] ?? null; setConversations(items); setSelectedConversationId(initialConversation?.id ?? null); setSelectedCustomerId(initialConversation?.customer_id ?? null); setInboxLoading(false); } }).catch((error) => { if (mounted) { setDataError(error instanceof Error ? error.message : 'Unable to load conversations.'); setInboxLoading(false); } });
     return () => { mounted = false; };
   }, [agentContext.agent.id]);
   useEffect(() => {
@@ -297,9 +324,9 @@ function DashboardApp({ agentContext }: { agentContext: AgentContext }) {
   };
 
   const selected = conversations.find((conversation) => conversation.id === selectedConversationId) as Conversation;
-  const openCount = conversations.filter((conversation) => conversation.status === 'open').length;
-  const mineCount = conversations.filter((conversation) => conversation.status === 'open' && conversation.assigned_agent_id === agentContext.agent.id).length;
-  const unassignedCount = conversations.filter((conversation) => conversation.status === 'open' && conversation.assigned_agent_id === null).length;
+  const openCount = conversations.filter(inInbox).length;
+  const mineCount = conversations.filter((conversation) => inInbox(conversation) && conversation.assigned_agent_id === agentContext.agent.id).length;
+  const unassignedCount = conversations.filter((conversation) => inInbox(conversation) && conversation.assigned_agent_id === null).length;
   const customerName = selected?.customer?.display_name || 'Unknown customer';
   const customerInitials = initialsFor(selected?.customer?.display_name);
 
