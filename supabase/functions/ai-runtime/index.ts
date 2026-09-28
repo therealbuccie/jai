@@ -55,7 +55,7 @@ async function authorized(header: string | null, key: string): Promise<boolean> 
 // A bounded read decision is executed locally using trusted identity; no provider-side tools.
 // Structured output contract: https://console.groq.com/docs/structured-outputs
 async function generateDecision(apiKey: string, turns: Turn[], knowledge: Knowledge[],
-  supportContext: CustomerSupportContext | undefined, allowRead: boolean,
+  supportContext: CustomerSupportContext | undefined, allowRead: boolean, workSignal: AbortSignal,
   privateReference?: { capability: JaiConnectReadCapability; data: JaiConnectReadResponse['data'] },
 ): Promise<Decision> {
   const canRead = allowRead && !privateReference;
@@ -64,7 +64,7 @@ async function generateDecision(apiKey: string, turns: Turn[], knowledge: Knowle
   const reference = privateReference ? JSON.stringify({ type: "private_account_reference", ...privateReference }) : null;
   if (reference && new TextEncoder().encode(reference).length > 17000) throw new Error("invalid_reference");
   const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
-    method: "POST", redirect: "error", signal: AbortSignal.timeout(45000),
+    method: "POST", redirect: "error", signal: AbortSignal.any([AbortSignal.timeout(45000), workSignal]),
     headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model: "openai/gpt-oss-20b", max_completion_tokens: 2048, reasoning_effort: "low",
@@ -152,27 +152,68 @@ Deno.serve(async (request: Request): Promise<Response> => {
   if (!await authorized(request.headers.get("authorization"), key)) return respond(401, { error: "Unauthorized" });
   const groqKey = Deno.env.get("GROQ_API_KEY");
   if (!groqKey) return respond(503, { error: "Provider not configured" });
-  // No caller-supplied job, app, conversation, prompt or message is accepted.
-  async function database(path: string, body?: Row, method = body ? "POST" : "GET"): Promise<unknown> {
-    const response = await fetch(`${url!.replace(/\/$/, "")}/rest/v1/${path}`, {
-      method, redirect: "error", signal: AbortSignal.timeout(10000),
-      headers: { apikey: key!, Authorization: `Bearer ${key!}`, "Content-Type": "application/json", Prefer: "return=representation" },
-      body: body ? JSON.stringify(body) : undefined,
+  // Limit interactive work to 25 seconds; reserve at least 35 seconds
+  // for a 10s completion, 10s recovery escalation and
+  // 10s fenced release, plus 5s margin. The existing 180s lease is unchanged.
+  const workController = new AbortController();
+  let workDeadline = Infinity;
+  let leaseDeadline = Infinity;
+  let workTimer: ReturnType<typeof setTimeout> | undefined;
+  const requireWorkBudget = (milliseconds: number) => {
+    if (workController.signal.aborted || Date.now() + milliseconds >= workDeadline) {
+      throw new Error("work_deadline");
+    }
+  };
+  async function withinWork<T>(operation: () => Promise<T>, milliseconds = 0): Promise<T> {
+    requireWorkBudget(milliseconds);
+    let abort!: () => void;
+    const deadline = new Promise<never>((_, reject) => {
+      abort = () => reject(new Error("work_deadline"));
+      workController.signal.addEventListener("abort", abort, { once: true });
     });
-    if (!response.ok) { await response.body?.cancel(); throw new Error("database_failed"); }
-    return response.json();
+    try { return await Promise.race([operation(), deadline]); }
+    finally { workController.signal.removeEventListener("abort", abort); }
+  }
+  // No caller-supplied job, app, conversation, prompt or message is accepted.
+  async function database(path: string, body?: Row, method = body ? "POST" : "GET", completion = false): Promise<unknown> {
+    const operation = async () => {
+      // Recovery uses its reserved window, not the aborted work signal.
+      const timeout = completion ? Math.min(10000, leaseDeadline - Date.now() - 1000) : 10000;
+      if (timeout <= 0) throw new Error("invalid_lease");
+      const signal = completion ? AbortSignal.timeout(timeout)
+        : AbortSignal.any([AbortSignal.timeout(timeout), workController.signal]);
+      const response = await fetch(`${url!.replace(/\/$/, "")}/rest/v1/${path}`, {
+        method, redirect: "error", signal,
+        headers: { apikey: key!, Authorization: `Bearer ${key!}`, "Content-Type": "application/json", Prefer: "return=representation" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (!response.ok) { await response.body?.cancel(); throw new Error("database_failed"); }
+      return response.json();
+    };
+    return completion ? operation() : withinWork(operation);
   }
   let job: Row | undefined;
   try {
     const claimed = await database("rpc/claim_ai_job", { p_lease_seconds: 180 });
     if (claimed === null) return respond(200, { status: "idle" });
     job = row(claimed);
+    leaseDeadline = typeof job.lease_expires_at === "string" ? Date.parse(job.lease_expires_at) : 0;
+    if (!Number.isFinite(leaseDeadline) || leaseDeadline <= Date.now()) throw new Error("invalid_lease");
+    workDeadline = Math.min(Date.now() + 25000, leaseDeadline - 35000);
+    workTimer = setTimeout(() => workController.abort(), Math.max(0, workDeadline - Date.now()));
+    requireWorkBudget(0);
     const jobId = id(job.id), token = id(job.lease_token);
     const conversationId = id(job.conversation_id), appId = id(job.app_id), sourceId = id(job.source_message_id);
-    const finish = async (content: string | null) => row(await database("rpc/finalize_ai_job", {
-      p_job_id: jobId, p_lease_token: token, p_content: content,
-    }));
-    const escalate = async () => row(await database("rpc/escalate_ai_job", { p_job_id: jobId, p_lease_token: token }));
+    const finish = async (content: string | null) => {
+      workController.abort();
+      return row(await database("rpc/finalize_ai_job", {
+        p_job_id: jobId, p_lease_token: token, p_content: content,
+      }, "POST", true));
+    };
+    const escalate = async () => {
+      workController.abort();
+      return row(await database("rpc/escalate_ai_job", { p_job_id: jobId, p_lease_token: token }, "POST", true));
+    };
     const conversations = await database(`conversations?id=eq.${conversationId}&app_id=eq.${appId}&select=id,app_id,customer_id,handler,status&limit=1`);
     if (!Array.isArray(conversations) || conversations.length !== 1) throw new Error("invalid_context");
     const conversation = row(conversations[0]);
@@ -229,12 +270,15 @@ Deno.serve(async (request: Request): Promise<Response> => {
     const loadSupportContext = async (): Promise<CustomerSupportContext | undefined> => {
       if (job!.retry_count !== 0) return undefined;
       try {
+        // Preparation is abortable at the interactive deadline. Reserve the
+        // client's full 10-second read deadline plus time for reasoning.
+        requireWorkBudget(11000);
         await recheckReadEligibility();
         const subject = await database("rpc/resolve_jai_connect_read_subject", {
           p_app_id: trustedAppId, p_customer_id: customerId,
         });
         if (typeof subject !== "string" || !subject.trim()) return undefined;
-        return await buildCustomerSupportContext({ app_id: trustedAppId, customer_id: customerId });
+        return await withinWork(() => buildCustomerSupportContext({ app_id: trustedAppId, customer_id: customerId }), 11000);
       } catch { return undefined; }
     };
     // The RPC independently enforces app capability, page readiness and hashes.
@@ -275,43 +319,72 @@ Deno.serve(async (request: Request): Promise<Response> => {
     }
     };
     // Independent public retrieval and four-read snapshot collection overlap.
-    const [supportContext] = await Promise.all([loadSupportContext(), loadKnowledge(source.content)]);
+    const sourceQuestion = source.content;
+    const [supportContext] = await withinWork(() =>
+      Promise.all([loadSupportContext(), loadKnowledge(sourceQuestion)]));
     let decision: Decision;
     try {
       turns.reverse();
       if (fastSubscription && supportContext?.availability.subscription !== "available") throw new Error("read_unavailable");
       // Fast questions use the snapshot's subscription without a duplicate read
       // or a routing pass. Follow-ups use history and the normal model decision.
-      decision = await generateDecision(groqKey, turns, knowledge, supportContext,
-        !fastSubscription && supportContext !== undefined && job.retry_count === 0);
+      const allowRead = !fastSubscription && supportContext !== undefined && job.retry_count === 0;
+      // Groq receives only the remaining interactive window via workSignal;
+      // its 45-second provider timeout remains an independent upper bound.
+      decision = await withinWork(() => generateDecision(groqKey, turns, knowledge, supportContext,
+        allowRead, workController.signal), 1000);
       if (decision.action === "read") {
         // Only the first lease acquisition may read. Recovery attempts cannot
         // repeat an outbound read whose outcome may have been lost on a crash.
         if (job.retry_count !== 0) throw new Error("read_unavailable");
+        // Rechecks share the work deadline. Recheck the full connector
+        // budget afterwards; reserve at least one second for the model.
+        requireWorkBudget(11000);
         await recheckReadEligibility();
         const capability = decision.capability;
-        const data = await readJaiConnect({ app_id: trustedAppId, customer_id: customerId, capability });
+        const data = await withinWork(() => readJaiConnect({ app_id: trustedAppId, customer_id: customerId, capability }), 11000);
         // One additional pass, with read excluded from both schema and validator.
-        decision = await generateDecision(groqKey, turns, knowledge, supportContext, false, { capability, data });
+        decision = await withinWork(() => generateDecision(groqKey, turns, knowledge, supportContext, false,
+          workController.signal, { capability, data }), 1000);
       }
     } catch {
       // Never forward connector/provider errors or invent missing account facts.
       decision = { action: "escalate", content: "" };
     }
+    if (workController.signal.aborted || Date.now() >= workDeadline) decision = { action: "escalate", content: "" };
     const result = decision.action === "reply" ? await finish(decision.content) : await escalate();
     return respond(200, { status: result.state, action: decision.action });
   } catch {
-    // Never log errors from fetch/provider/database: they can contain sensitive data.
-    // Keep the lease recoverable; bound repeated infrastructure failures.
+    workController.abort();
+    // The guarded RPC rechecks ownership and handler/status under locks. If a
+    // timed-out completion already committed, it returns that terminal job.
     if (job && typeof job.id === "string" && UUID.test(job.id) && typeof job.lease_token === "string" && UUID.test(job.lease_token)) {
+      if (Number.isFinite(leaseDeadline) && Date.now() < leaseDeadline - 1000) {
+        try {
+          const result = row(await database("rpc/escalate_ai_job", {
+            p_job_id: job.id, p_lease_token: job.lease_token,
+          }, "POST", true));
+          return respond(200, { status: result.state });
+        } catch { /* Try a fenced release if guarded recovery is unreachable. */ }
+      }
       const terminal = Number(job.retry_count) >= 3;
       const now = new Date().toISOString();
-      const update: Row = { last_error: "runtime_failed", updated_at: now };
-      if (terminal) Object.assign(update, { state: "failed", finished_at: now, lease_token: null, lease_expires_at: null });
+      // Never overwrite a completed job or a replacement worker's lease.
+      // Only failed guarded recovery reaches this infrastructure fallback.
+      // Pending is recoverable, not a claimed successful handoff; return 503.
+      // No retry invocation is implied by this release.
+      const update: Row = {
+        last_error: "runtime_failed", updated_at: now,
+        state: terminal ? "failed" : "pending", finished_at: terminal ? now : null,
+        lease_token: null, lease_expires_at: null,
+      };
       try {
-        await database(`ai_jobs?id=eq.${job.id}&state=eq.processing&lease_token=eq.${job.lease_token}&lease_expires_at=gt.${encodeURIComponent(now)}`, update, "PATCH");
-      } catch { /* An expired processing lease remains recoverable. */ }
+        await database(`ai_jobs?id=eq.${job.id}&state=eq.processing&lease_token=eq.${job.lease_token}&lease_expires_at=gt.${encodeURIComponent(now)}`, update, "PATCH", true);
+      } catch { /* A database outage still requires external lease recovery. */ }
     }
     return respond(503, { error: "Worker attempt failed" });
+  } finally {
+    clearTimeout(workTimer);
+    workController.abort();
   }
 });
