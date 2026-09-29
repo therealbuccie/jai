@@ -1,3 +1,4 @@
+import { useAgentNotifications } from './useAgentNotifications';
 import { useInboxRealtime } from './useInboxRealtime';
 import { useAgentPresence, type AgentPresence } from './useAgentPresence';
 import { AcceptInvitation } from './AcceptInvitation';
@@ -86,7 +87,7 @@ async function loadAgentPoints(agentId: string): Promise<number> {
   return (data ?? []).reduce((total, row) => total + (typeof row.points === 'number' ? row.points : 0), 0);
 }
 
-function getSection() { const section = window.location.hash.slice(1); return ['inbox', 'apps', 'customers', 'team', 'settings'].includes(section) ? section : 'inbox'; }
+function getSection() { const section = window.location.hash.slice(1).split('?')[0]; return ['inbox', 'apps', 'customers', 'team', 'settings'].includes(section) ? section : 'inbox'; }
 
 function TransferControl({ conversation, onTransferred, assign = false }: { conversation: Conversation; onTransferred: (conversation: Conversation) => void; assign?: boolean }) {
   const action = assign ? 'Assign' : 'Transfer';
@@ -288,6 +289,26 @@ function DashboardApp({ agentContext, onLogout, presence }: { agentContext: Agen
   useEffect(() => { const update = () => setSection(getSection()); window.addEventListener('hashchange', update); return () => window.removeEventListener('hashchange', update); }, []);
   const selectionRef = useRef(selectedConversationId);
   selectionRef.current = selectedConversationId;
+  const notifications = useAgentNotifications(agentContext.agent.id, conversations);
+  const [linkError, setLinkError] = useState('');
+  const [linkRequest, setLinkRequest] = useState(() => window.location.hash);
+  useEffect(() => {
+    const changed = () => setLinkRequest(window.location.hash);
+    window.addEventListener('hashchange', changed);
+    return () => window.removeEventListener('hashchange', changed);
+  }, []);
+  useEffect(() => {
+    const id = new URLSearchParams(linkRequest.split('?')[1] || '').get('conversation');
+    if (!id) { setLinkError(''); return; }
+    let active = true;
+    void loadConversations().then(items => {
+      if (!active) return;
+      const target = items.find(item => item.id === id);
+      if (!target) { setLinkError('Conversation unavailable.'); return; }
+      setConversations(items); setSelectedCustomerId(target.customer_id); setSelectedConversationId(target.id); setLinkError('');
+    }).catch(() => { if (active) setLinkError('Conversation unavailable.'); });
+    return () => { active = false; };
+  }, [linkRequest, agentContext.agent.id]);
   const initializedInbox = useRef(false);
   const threadVersion = useRef(0);
   useInboxRealtime(agentContext.user.id, agentContext.apps.map(app => app.id), conversations.map(item => item.id), async current => {
@@ -299,7 +320,8 @@ function DashboardApp({ agentContext, onLogout, presence }: { agentContext: Agen
       setConversations(items); setDataError(null); setInboxLoading(false);
       if (!initializedInbox.current) {
         initializedInbox.current = true;
-        const initial = items.filter(inInbox).sort(inboxPriority)[0] ?? items[0] ?? null;
+        const linkedId = new URLSearchParams(window.location.hash.split('?')[1] || '').get('conversation');
+        const initial = linkedId ? items.find(item => item.id === linkedId) ?? null : items.filter(inInbox).sort(inboxPriority)[0] ?? items[0] ?? null;
         setSelectedConversationId(initial?.id ?? null); setSelectedCustomerId(initial?.customer_id ?? null);
         return;
       }
@@ -415,7 +437,12 @@ function DashboardApp({ agentContext, onLogout, presence }: { agentContext: Agen
   const customerName = selected?.customer?.display_name || 'Unknown customer';
   const customerInitials = initialsFor(selected?.customer?.display_name);
 
-  return <ApprovedDashboardPresentation
+  return <>
+    {(notifications.notices.length > 0 || linkError) && <aside aria-live="polite" style={{ position: 'fixed', right: 20, bottom: 20, zIndex: 100, maxWidth: 340, padding: 14, background: 'white', color: '#17342c', border: '1px solid #dfe8e3', borderRadius: 8, boxShadow: '0 3px 14px #0002' }}>
+      {notifications.notices.map(notice => <div key={notice.id}><button type="button" onClick={() => notifications.open(notice)} style={{ background: 'none', border: 0, textAlign: 'left', color: 'inherit', cursor: 'pointer' }}><strong>{notice.title} ? {notice.app_name}</strong>{notice.body && <p>{notice.body}</p>}</button><button type="button" onClick={() => notifications.dismiss(notice.id)} aria-label="Dismiss notification">?</button></div>)}
+      {linkError && <p>{linkError}<button type="button" onClick={() => setLinkError('')}>Dismiss</button></p>}
+    </aside>}
+    <ApprovedDashboardPresentation
     section={section}
     agent={agentContext.agent}
     conversations={conversations}
@@ -450,7 +477,7 @@ function DashboardApp({ agentContext, onLogout, presence }: { agentContext: Agen
     presence={presence}
     sendError={sendError}
     isSending={isSending}
-  />;
+  /></>;
 
   return <div className="dashboard">
     <aside className="sidebar" aria-label="JAI sidebar"><div className="wordmark" aria-label="JAI"><svg viewBox="0 0 76 44" aria-hidden="true"><path d="M20 9v23c0 6-3 9-9 9-4 0-7-2-9-5l4-4c1 2 3 3 5 3 3 0 4-1 4-4V9Z" /><path d="M27 40 44 9l17 31h-7L44 21 34 40Z" /><path d="M66 14h6v26h-6Z" /><circle className="wordmark-dot" cx="69" cy="6" r="4" /></svg></div><nav className="navigation" aria-label="Main navigation"><a className="nav-item" href="#inbox" aria-current={section === 'inbox' ? 'page' : undefined}>Inbox</a><a className="nav-item" href="#customers" aria-current={section === 'customers' ? 'page' : undefined}>Customers</a><a className="nav-item" href="#team" aria-current={section === 'team' ? 'page' : undefined}>Team</a><a className="nav-item" href="#settings" aria-current={section === 'settings' ? 'page' : undefined}>Settings</a></nav><div className="agent-profile"><div className="agent-avatar" aria-hidden="true">{initialsFor(agentContext.agent.name)}</div><span className="agent-name">{agentContext.agent.name}</span><span className="agent-status">{agentContext.agent.status}</span></div></aside>

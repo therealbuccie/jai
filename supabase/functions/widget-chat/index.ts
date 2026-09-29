@@ -237,7 +237,7 @@ Deno.serve(async (request: Request): Promise<Response> => {
 
     if (input.action === "list_conversations") {
       const conversationResponse = await database(
-        `conversations?customer_id=eq.${session.customer_id}&app_id=eq.${session.app_id}&select=id,status,created_at,updated_at&order=updated_at.desc`,
+        `conversations?customer_id=eq.${session.customer_id}&app_id=eq.${session.app_id}&select=id,status,handler,created_at,updated_at&order=updated_at.desc`,
       );
       const conversations: unknown = await conversationResponse.json();
       if (!Array.isArray(conversations)) throw new Error("Invalid database response");
@@ -271,12 +271,14 @@ Deno.serve(async (request: Request): Promise<Response> => {
       }
       const history = conversations.flatMap((value) => {
         if (!isObject(value) || typeof value.id !== "string" || !UUID.test(value.id) ||
-          typeof value.status !== "string" || typeof value.created_at !== "string" || typeof value.updated_at !== "string") return [];
+          typeof value.status !== "string" || !["open", "pending", "resolved"].includes(value.status) ||
+          typeof value.handler !== "string" || !["automation", "human_queue", "human_agent"].includes(value.handler) || typeof value.created_at !== "string" || typeof value.updated_at !== "string") return [];
         const latest = latestByConversation.get(value.id);
         const feedback = feedbackByConversation.get(value.id);
         return [{
           conversationId: value.id,
           status: value.status,
+          handler: value.handler,
           createdAt: value.created_at,
           updatedAt: value.updated_at,
           latestMessagePreview: latest && typeof latest.content === "string" ? latest.content : null,

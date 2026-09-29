@@ -21,6 +21,7 @@ type StoredSession = { sessionToken: string; expiresAt: string };
 type ConversationSummary = {
   conversationId: string;
   status: 'open' | 'pending' | 'resolved';
+  handler: 'automation' | 'human_queue' | 'human_agent' | null;
   createdAt: string;
   updatedAt: string;
   latestMessagePreview: string | null;
@@ -182,6 +183,7 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
       return [{
         conversationId: conversation.conversationId,
         status: conversation.status as ConversationSummary['status'],
+        handler: conversation.handler === 'automation' || conversation.handler === 'human_queue' || conversation.handler === 'human_agent' ? conversation.handler : null,
         createdAt: conversation.createdAt,
         updatedAt: conversation.updatedAt,
         latestMessagePreview: typeof conversation.latestMessagePreview === 'string' ? conversation.latestMessagePreview : null,
@@ -372,8 +374,9 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
     sendingRef.current = true;
     setIsSending(true);
     setSendError(null);
-    pendingReplyRef.current = { conversationId: activeConversationId, messageId: null, startedAt: Date.now() };
-    setTypingMessageId(crypto.randomUUID());
+    const automation = !activeConversationId || conversationHistory.find(c => c.conversationId === activeConversationId)?.handler === 'automation';
+    pendingReplyRef.current = automation ? { conversationId: activeConversationId, messageId: null, startedAt: Date.now() } : null;
+    setTypingMessageId(automation ? crypto.randomUUID() : null);
     setTypingStage(0);
     let sent = false;
     try {
@@ -420,13 +423,17 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
     }
   };
 
+  const activeConversationSummary = conversationHistory.find((conversation) => conversation.conversationId === activeConversationId);
+  const activeConversationClosed = activeConversationSummary?.status === 'resolved';
+  const automationWaitingAllowed = !activeConversationId || activeConversationSummary?.handler === 'automation';
+
   useEffect(() => {
-    if (!typingMessageId || !pendingReplyRef.current) return;
+    if (!typingMessageId || !pendingReplyRef.current || !automationWaitingAllowed || activeConversationClosed) return;
     const startedAt = pendingReplyRef.current.startedAt;
     const eightSeconds = window.setTimeout(() => setTypingStage(1), Math.max(0, startedAt + 8000 - Date.now()));
     const twentySeconds = window.setTimeout(() => setTypingStage(2), Math.max(0, startedAt + 20000 - Date.now()));
     return () => { window.clearTimeout(eightSeconds); window.clearTimeout(twentySeconds); };
-  }, [typingMessageId]);
+  }, [typingMessageId, automationWaitingAllowed, activeConversationClosed]);
 
   useEffect(() => {
     if (!threadRef.current) return;
@@ -440,17 +447,15 @@ export function JaiSupportWidget({ appId, productName, verifiedSessionToken, sup
     }
   };
 
-  const activeConversationSummary = conversationHistory.find((conversation) => conversation.conversationId === activeConversationId);
-  const activeConversationClosed = activeConversationSummary?.status === 'resolved';
-  const showTyping = typingMessageId !== null && !activeConversationClosed &&
+  const showTyping = typingMessageId !== null && automationWaitingAllowed && !activeConversationClosed &&
     pendingReplyRef.current?.conversationId === activeConversationId && !sendError;
   useEffect(() => {
-    if (activeConversationClosed) {
+    if (activeConversationClosed || !automationWaitingAllowed) {
       pendingReplyRef.current = null;
       setTypingMessageId(null);
       setTypingStage(0);
     }
-  }, [activeConversationClosed]);
+  }, [activeConversationClosed, automationWaitingAllowed]);
   useEffect(() => () => { pendingReplyRef.current = null; }, []);
   const widgetClassName = ['jai-support-widget', isOpen ? 'is-open' : '', className].filter(Boolean).join(' ');
 
