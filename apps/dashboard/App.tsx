@@ -1,3 +1,5 @@
+import { useInboxRealtime } from './useInboxRealtime';
+import { useAgentPresence, type AgentPresence } from './useAgentPresence';
 import { AcceptInvitation } from './AcceptInvitation';
 import { useEffect, useRef, useState } from 'react';
 import type { User } from '@supabase/supabase-js';
@@ -89,7 +91,7 @@ function getSection() { const section = window.location.hash.slice(1); return ['
 function TransferControl({ conversation, onTransferred, assign = false }: { conversation: Conversation; onTransferred: (conversation: Conversation) => void; assign?: boolean }) {
   const action = assign ? 'Assign' : 'Transfer';
   const [open, setOpen] = useState(false);
-  const [agents, setAgents] = useState<Array<{ id: string; name: string; assignment_id: string | null }>>([]);
+  const [agents, setAgents] = useState<Array<{ id: string; name: string; assignment_id: string | null; presence: AgentPresence }>>([]);
   const [target, setTarget] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -123,7 +125,7 @@ function TransferControl({ conversation, onTransferred, assign = false }: { conv
       {busy && <p role="status">Please wait...</p>}
       {!busy && !error && !agents.length && <p>No eligible agents available.</p>}
       {!!agents.length && <><select aria-label="New assigned agent" value={target} disabled={busy} onChange={event => setTarget(event.target.value)}>
-        <option value="">Select an agent</option>{agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name}</option>)}
+        <option value="">Select an agent</option>{agents.map(agent => <option key={agent.id} value={agent.id}>{agent.name} ? {agent.presence === 'online' ? 'Online' : agent.presence === 'away' ? 'Away' : 'Offline'}</option>)}
       </select><button type="button" disabled={busy || !target} onClick={() => void transfer()}>Confirm {action.toLowerCase()}</button></>}
       <button type="button" disabled={busy} onClick={() => setOpen(false)}>Cancel</button>
     </div>}{error && <p role="alert">{error}</p>}
@@ -159,6 +161,7 @@ function ApprovedDashboardPresentation({
   feedback,
   agentPoints,
   onLogout,
+  presence,
   sendError,
   isSending,
 }: {
@@ -190,6 +193,7 @@ function ApprovedDashboardPresentation({
   feedback: ConversationFeedback | null;
   agentPoints: number;
   onLogout: () => Promise<void>;
+  presence: AgentPresence;
   sendError: string | null;
   isSending: boolean;
 }) {
@@ -236,7 +240,7 @@ function ApprovedDashboardPresentation({
         <a className="nav-item" href="#settings" aria-current={section === 'settings' ? 'page' : undefined}><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9.5 3-.6 2.3-1.6.9-2.3-.6-2.5 4.3 1.7 1.7v1.8l-1.7 1.7L5 19.4l2.3-.6 1.6.9.6 2.3h5l.6-2.3 1.6-.9 2.3.6 2.5-4.3-1.7-1.7v-1.8l1.7-1.7L19 5.6l-2.3.6-1.6-.9L14.5 3Z" /><circle cx="12" cy="12.5" r="3.3" /></svg><span>Settings</span></a>
         <a className="nav-item" href="#apps" aria-current={section === 'apps' ? 'page' : undefined}><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1" /><rect x="14" y="3" width="7" height="7" rx="1" /><rect x="3" y="14" width="7" height="7" rx="1" /><rect x="14" y="14" width="7" height="7" rx="1" /></svg><span>Apps</span></a>
       </nav>
-      <div className="agent-profile" aria-label="Agent profile"><div className="agent-avatar" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 22v-2a8 8 0 0 1 16 0v2" /></svg><span className="status-dot" /></div><span className="agent-name">{agent.name}</span><span className="agent-status">{agent.status}</span><span className="agent-points">{agentPoints} points</span><button type="button" onClick={() => void onLogout()} style={{ gridColumn: '2 / -1', justifySelf: 'start', background: 'none', border: 0, padding: '4px 0', color: 'inherit', font: 'inherit', cursor: 'pointer' }}>Log out</button></div>
+      <div className="agent-profile" aria-label="Agent profile"><div className="agent-avatar" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="8" r="4" /><path d="M4 22v-2a8 8 0 0 1 16 0v2" /></svg><span className="status-dot" style={{ background: presence === 'online' ? '#19ad7a' : presence === 'away' ? '#c68a22' : '#87928c' }} /></div><span className="agent-name">{agent.name}</span><span className="agent-status">{presence === 'online' ? 'Online' : presence === 'away' ? 'Away' : 'Offline'}</span><span className="agent-points">{agentPoints} points</span><button type="button" onClick={() => void onLogout()} style={{ gridColumn: '2 / -1', justifySelf: 'start', background: 'none', border: 0, padding: '4px 0', color: 'inherit', font: 'inherit', cursor: 'pointer' }}>Log out</button></div>
     </aside>
     <main className="content" aria-label={section} id={section} tabIndex={-1}>
       {section === 'apps' && <AppsPage organizationId={agent.organization_id} isAdmin={agent.role === 'admin'} />}
@@ -261,7 +265,7 @@ function ApprovedDashboardPresentation({
   </div>;
 }
 
-function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; onLogout: () => Promise<void> }) {
+function DashboardApp({ agentContext, onLogout, presence }: { agentContext: AgentContext; onLogout: () => Promise<void>; presence: AgentPresence }) {
   const [section, setSection] = useState(getSection);
   const [customerPanelOpen, setCustomerPanelOpen] = useState(true);
   const [conversations, setConversations] = useState<Conversation[]>([]);
@@ -282,15 +286,42 @@ function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; 
   const threadRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => { const update = () => setSection(getSection()); window.addEventListener('hashchange', update); return () => window.removeEventListener('hashchange', update); }, []);
-  useEffect(() => {
-    let mounted = true;
-    void loadConversations().then((items) => { if (mounted) { const initialConversation = items.filter(inInbox).sort(inboxPriority)[0] ?? items[0] ?? null; setConversations(items); setSelectedConversationId(initialConversation?.id ?? null); setSelectedCustomerId(initialConversation?.customer_id ?? null); setInboxLoading(false); } }).catch((error) => { if (mounted) { setDataError(error instanceof Error ? error.message : 'Unable to load conversations.'); setInboxLoading(false); } });
-    return () => { mounted = false; };
-  }, [agentContext.agent.id]);
+  const selectionRef = useRef(selectedConversationId);
+  selectionRef.current = selectedConversationId;
+  const initializedInbox = useRef(false);
+  const threadVersion = useRef(0);
+  useInboxRealtime(agentContext.user.id, agentContext.apps.map(app => app.id), conversations.map(item => item.id), async current => {
+    const selectedId = selectionRef.current;
+    const version = ++threadVersion.current;
+    try {
+      const items = await loadConversations();
+      if (!current()) return;
+      setConversations(items); setDataError(null); setInboxLoading(false);
+      if (!initializedInbox.current) {
+        initializedInbox.current = true;
+        const initial = items.filter(inInbox).sort(inboxPriority)[0] ?? items[0] ?? null;
+        setSelectedConversationId(initial?.id ?? null); setSelectedCustomerId(initial?.customer_id ?? null);
+        return;
+      }
+      if (selectionRef.current !== selectedId) return;
+      if (selectedId && !items.some(item => item.id === selectedId)) {
+        setSelectedConversationId(null); setSelectedCustomerId(null); setThreadMessages([]); setConversationFeedback(null); setComposerText('');
+        return;
+      }
+      if (selectedId) {
+        const [messages, feedback] = await Promise.all([loadMessages(selectedId), loadFeedback(selectedId)]);
+        if (!current() || selectionRef.current !== selectedId || threadVersion.current !== version) return;
+        setThreadMessages(messages); setConversationFeedback(feedback);
+      }
+    } catch {
+      if (current() && !initializedInbox.current) { setDataError('Unable to load conversations. Retrying automatically.'); setInboxLoading(false); }
+    }
+  });
   useEffect(() => {
     if (!selectedConversationId) { setThreadMessages([]); setConversationFeedback(null); return; }
+    const version = ++threadVersion.current;
     let mounted = true; setThreadLoading(true); setDataError(null); setSendError(null); setComposerText('');
-    void Promise.all([loadMessages(selectedConversationId), loadFeedback(selectedConversationId)]).then(([items, feedback]) => { if (mounted) { setThreadMessages(items); setConversationFeedback(feedback); } }).catch((error) => { if (mounted) setDataError(error instanceof Error ? error.message : 'Unable to load this conversation.'); }).finally(() => { if (mounted) setThreadLoading(false); });
+    void Promise.all([loadMessages(selectedConversationId), loadFeedback(selectedConversationId)]).then(([items, feedback]) => { if (mounted && version === threadVersion.current) { setThreadMessages(items); setConversationFeedback(feedback); } }).catch((error) => { if (mounted) setDataError(error instanceof Error ? error.message : 'Unable to load this conversation.'); }).finally(() => { if (mounted) setThreadLoading(false); });
     return () => { mounted = false; };
   }, [selectedConversationId]);
 
@@ -325,7 +356,8 @@ function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; 
       return;
     }
     const message = insertedMessage as Message;
-    setThreadMessages((messages) => [...messages, message]);
+    ++threadVersion.current;
+    setThreadMessages((messages) => messages.some(item => item.id === message.id) ? messages : [...messages, message]);
     setConversations((items) => items.map((conversation) => conversation.id === selectedConversationId
       ? { ...conversation, latestMessage: message, updated_at: message.created_at }
       : conversation));
@@ -415,6 +447,7 @@ function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; 
     feedback={conversationFeedback}
     agentPoints={agentPoints}
     onLogout={onLogout}
+    presence={presence}
     sendError={sendError}
     isSending={isSending}
   />;
@@ -433,7 +466,14 @@ function DashboardApp({ agentContext, onLogout }: { agentContext: AgentContext; 
 function LoginScreen({ onSubmit, error, isSubmitting }: { onSubmit: (email: string, password: string) => Promise<void>; error: string | null; isSubmitting: boolean }) { const [email, setEmail] = useState(''); const [password, setPassword] = useState(''); return <main className="auth-screen"><form className="auth-card" onSubmit={(event) => { event.preventDefault(); void onSubmit(email, password); }}><div className="auth-mark">JAI</div><h1>Sign in to JAI</h1><p>Use your JAI human agent account.</p><label>Email<input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} required /></label><label>Password<input type="password" autoComplete="current-password" value={password} onChange={(event) => setPassword(event.target.value)} required /></label>{error && <div className="auth-error" role="alert">{error}</div>}<button type="submit" disabled={isSubmitting}>{isSubmitting ? 'Signing in...' : 'Sign in'}</button></form></main>; }
 function AuthMessage({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) { return <main className="auth-screen"><section className="auth-card"><div className="auth-mark">JAI</div><h1>{children}</h1>{action}</section></main>; }
 
-async function resolveAgentContext(user: User): Promise<AgentContext> { if (!supabase) throw new Error(supabaseConfigError ?? 'Supabase is not configured.'); const { data: agent, error: agentError } = await supabase.from('human_agents').select('id, auth_user_id, organization_id, name, email, role, status').eq('auth_user_id', user.id).maybeSingle(); if (agentError) throw new Error('Unable to resolve the JAI agent profile.'); if (!agent) throw new Error('This account is authenticated but is not authorized as a JAI human agent.'); const [{ data: organization, error: organizationError }, { data: apps, error: appsError }, { data: appAccess, error: accessError }] = await Promise.all([supabase.from('organizations').select('id, name').eq('id', agent.organization_id).single(), supabase.from('apps').select('id, organization_id, name, slug, status').eq('organization_id', agent.organization_id).order('name'), supabase.from('agent_app_access').select('app_id').eq('agent_id', agent.id)]); if (organizationError || appsError || accessError || !organization) throw new Error('Unable to load the JAI agent access context.'); return { user, agent, organization, apps: apps ?? [], appAccess: appAccess ?? [] }; }
+class AgentAccessDenied extends Error {}
+class AgentSessionInvalid extends Error {}
+function checkAgentAccessError(error: { code?: string } | null) {
+  if (error?.code === 'PGRST301' || error?.code === 'PGRST303') throw new AgentSessionInvalid();
+  if (error?.code === '42501') throw new AgentAccessDenied();
+}
+
+async function resolveAgentContext(user: User): Promise<AgentContext> { if (!supabase) throw new Error(supabaseConfigError ?? 'Supabase is not configured.'); const { data: agent, error: agentError } = await supabase.from('human_agents').select('id, auth_user_id, organization_id, name, email, role, status').eq('auth_user_id', user.id).maybeSingle(); checkAgentAccessError(agentError); if (agentError) throw new Error('Unable to resolve the JAI agent profile.'); if (!agent) throw new AgentAccessDenied('This account is authenticated but is not authorized as a JAI human agent.'); const [{ data: organization, error: organizationError }, { data: apps, error: appsError }, { data: appAccess, error: accessError }] = await Promise.all([supabase.from('organizations').select('id, name').eq('id', agent.organization_id).single(), supabase.from('apps').select('id, organization_id, name, slug, status').eq('organization_id', agent.organization_id).order('name'), supabase.from('agent_app_access').select('app_id').eq('agent_id', agent.id)]); checkAgentAccessError(organizationError); checkAgentAccessError(appsError); checkAgentAccessError(accessError); if (organizationError || appsError || accessError || !organization) throw new Error('Unable to load the JAI agent access context.'); return { user, agent, organization, apps: apps ?? [], appAccess: appAccess ?? [] }; }
 
 export default function App() {
   const invitationId = new URLSearchParams(window.location.search).get('invitation');
@@ -446,26 +486,41 @@ function AuthenticatedApp() {
   const [authError, setAuthError] = useState<string | null>(supabaseConfigError);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const sessionVersion = useRef(0);
+  const establishedUserId = useRef<string | null>(null);
   const loggingOut = useRef(false);
+  const [presenceAgentId, setPresenceAgentId] = useState<string>();
+  const { presence, stopPresence } = useAgentPresence(presenceAgentId);
   useEffect(() => {
     if (!supabase) return;
     let mounted = true;
     const applySession = (user: User | null) => {
       const version = ++sessionVersion.current;
-      setAgentContext(null);
+      const sameUser = !!user && establishedUserId.current === user.id;
       setAuthError(null);
-      if (!user || loggingOut.current) { setAuthState('signed-out'); return; }
-      setAuthState('checking');
+      if (!user || loggingOut.current) {
+        establishedUserId.current = null; setAgentContext(null);
+        setPresenceAgentId(undefined); setAuthState('signed-out'); return;
+      }
+      if (!sameUser) {
+        establishedUserId.current = null; setAgentContext(null);
+        setPresenceAgentId(undefined); setAuthState('checking');
+      }
       // Leave the Auth callback before starting authenticated database requests.
       void Promise.resolve().then(() => {
         if (!mounted || version !== sessionVersion.current) return null;
         return resolveAgentContext(user);
       }).then(context => {
         if (!mounted || version !== sessionVersion.current || !context) return;
-        setAgentContext(context); setAuthState('authenticated');
-      }).catch(() => {
+        establishedUserId.current = user.id;
+        setAgentContext(context); setPresenceAgentId(user.id); setAuthState('authenticated');
+      }).catch(error => {
         if (!mounted || version !== sessionVersion.current) return;
-        setAuthError('Unable to load your authorized agent account.'); setAuthState('unauthorized');
+        if (sameUser && !(error instanceof AgentAccessDenied) && !(error instanceof AgentSessionInvalid)) return;
+        establishedUserId.current = null; setAgentContext(null);
+        if (error instanceof AgentSessionInvalid) {
+          setPresenceAgentId(undefined); setAuthError('Please sign in again.'); setAuthState('signed-out'); return;
+        }
+        setPresenceAgentId(undefined); setAuthError('Unable to load your authorized agent account.'); setAuthState('unauthorized');
       });
     };
     const initialVersion = sessionVersion.current;
@@ -495,9 +550,13 @@ function AuthenticatedApp() {
   const signOut = async () => {
     if (!supabase || loggingOut.current) return;
     loggingOut.current = true;
+    establishedUserId.current = null;
     ++sessionVersion.current;
+    const presenceCleanup = stopPresence();
+    setPresenceAgentId(undefined);
     setAgentContext(null); setAuthError(null); setAuthState('signed-out'); setIsSubmitting(true);
     try {
+      await Promise.race([presenceCleanup, new Promise<void>(resolve => setTimeout(resolve, 1500))]);
       const { error } = await supabase.auth.signOut({ scope: 'local' });
       if (error) throw error;
     } catch {
@@ -508,5 +567,5 @@ function AuthenticatedApp() {
   if (authState === 'signed-out') return <LoginScreen onSubmit={signIn} error={authError} isSubmitting={isSubmitting} />;
   if (authState === 'unauthorized') return <AuthMessage action={<button type="button" onClick={() => void signOut()}>Log out</button>}>{authError ?? 'This account is not authorized as a JAI human agent.'}</AuthMessage>;
   if (!agentContext) return <AuthMessage>Unable to load the JAI dashboard.</AuthMessage>;
-  return <DashboardApp key={agentContext.user.id} agentContext={agentContext} onLogout={signOut} />;
+  return <DashboardApp key={agentContext.user.id} agentContext={agentContext} onLogout={signOut} presence={presence} />;
 }
